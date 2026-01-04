@@ -1,10 +1,10 @@
 """
-Leaderboard - Tabla de Clasificación para Grupo de Estudio de Medicina
-=======================================================================
-Aplicación Streamlit que integra datos de AnkiWeb y Notion para crear
-un dashboard interactivo de seguimiento de estudio.
+Dashboard de Competencia Académica Multi-Curso
+==============================================
+Aplicación Streamlit para grupos de estudio de medicina.
+Integra datos de AnkiWeb (por mazo/curso) y Notion (quices por curso).
 
-Autor: Desarrollador Senior Python - Data Engineering
+Autor: Lead Python Developer - Data Engineering
 """
 
 import streamlit as st
@@ -15,31 +15,89 @@ from notion_client import Client
 from datetime import datetime
 import re
 import time
+from typing import Dict, List, Optional, Tuple
 
 # ============================================================================
 # CONFIGURACIÓN Y CONSTANTES
 # ============================================================================
 
-# ID de la Base de Datos de Notion (configurar según tu workspace)
-NOTION_DATABASE_ID = "TU_DATABASE_ID_AQUI"
+# Lista de cursos disponibles - MODIFICAR SEGÚN NECESIDAD
+CURSOS = ["Epidemiología", "Farmacología", "Patología"]
 
-# Fórmula de puntaje: (Tarjetas Anki * 0.5) + (Puntos Notion * 10)
+# Palabras clave para buscar mazos en AnkiWeb (mapeo curso -> keywords)
+CURSO_KEYWORDS = {
+    "Epidemiología": ["epidemio", "epi", "bioestadística", "bioestad"],
+    "Farmacología": ["farma", "farmaco", "farmacología"],
+    "Patología": ["pato", "patología", "patologia"],
+}
+
+# Multiplicadores para el cálculo de score
 ANKI_MULTIPLIER = 0.5
 NOTION_MULTIPLIER = 10
 
+# ID de la Base de Datos de Notion (se lee de secrets si está disponible)
+DEFAULT_NOTION_DATABASE_ID = "TU_DATABASE_ID_AQUI"
+
+
 # ============================================================================
-# CLASE PARA SCRAPING DE ANKIWEB
+# FUNCIONES DE UTILIDAD
+# ============================================================================
+
+def safe_get_secret(key: str, default: str = "") -> str:
+    """Obtiene un secreto de forma segura, retornando default si no existe."""
+    try:
+        return st.secrets.get(key, default)
+    except FileNotFoundError:
+        return default
+    except Exception:
+        return default
+
+
+def normalize_text(text: str) -> str:
+    """Normaliza texto para comparación (lowercase, sin acentos comunes)."""
+    text = text.lower().strip()
+    replacements = {
+        'á': 'a', 'é': 'e', 'í': 'i', 'ó': 'o', 'ú': 'u',
+        'ñ': 'n', 'ü': 'u'
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    return text
+
+
+def match_course_in_deck(deck_name: str, curso: str) -> bool:
+    """
+    Verifica si el nombre de un mazo corresponde a un curso específico.
+    
+    Args:
+        deck_name: Nombre del mazo de Anki
+        curso: Nombre del curso a buscar
+        
+    Returns:
+        True si el mazo corresponde al curso
+    """
+    deck_normalized = normalize_text(deck_name)
+    
+    # Obtener keywords del curso
+    keywords = CURSO_KEYWORDS.get(curso, [normalize_text(curso)])
+    
+    # Verificar si alguna keyword está en el nombre del mazo
+    return any(kw in deck_normalized for kw in keywords)
+
+
+# ============================================================================
+# CLASE PARA SCRAPING DE ANKIWEB - VERSIÓN MEJORADA
 # ============================================================================
 
 class AnkiWebScraper:
     """
-    Cliente para extraer estadísticas de AnkiWeb mediante web scraping.
-    Utiliza requests con manejo de sesión y cookies.
+    Cliente mejorado para extraer estadísticas de AnkiWeb por mazo.
+    Soporta extracción granular de mazos específicos por curso.
     """
     
     BASE_URL = "https://ankiweb.net"
     LOGIN_URL = f"{BASE_URL}/account/login"
-    STATS_URL = f"{BASE_URL}/decks/"
+    DECKS_URL = f"{BASE_URL}/decks/"
     
     def __init__(self):
         self.session = requests.Session()
@@ -48,33 +106,34 @@ class AnkiWebScraper:
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
             'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
         })
+        self.logged_in = False
     
     def _get_csrf_token(self, html_content: str) -> str:
         """Extrae el token CSRF del formulario de login."""
         soup = BeautifulSoup(html_content, 'html.parser')
+        
+        # Buscar en input hidden
         csrf_input = soup.find('input', {'name': 'csrf_token'})
-        if csrf_input:
+        if csrf_input and csrf_input.get('value'):
             return csrf_input.get('value', '')
-        # Alternativa: buscar en meta tags
+        
+        # Buscar en meta tags
         csrf_meta = soup.find('meta', {'name': 'csrf-token'})
-        if csrf_meta:
+        if csrf_meta and csrf_meta.get('content'):
             return csrf_meta.get('content', '')
+        
         return ''
     
-    def login(self, username: str, password: str) -> bool:
+    def login(self, username: str, password: str) -> Tuple[bool, str]:
         """
         Realiza el login en AnkiWeb.
         
-        Args:
-            username: Email o nombre de usuario de AnkiWeb
-            password: Contraseña de la cuenta
-            
         Returns:
-            True si el login fue exitoso, False en caso contrario
+            Tuple (éxito: bool, mensaje: str)
         """
         try:
             # Obtener página de login para CSRF token
-            response = self.session.get(self.LOGIN_URL)
+            response = self.session.get(self.LOGIN_URL, timeout=15)
             response.raise_for_status()
             
             csrf_token = self._get_csrf_token(response.text)
@@ -91,144 +150,220 @@ class AnkiWebScraper:
             response = self.session.post(
                 self.LOGIN_URL,
                 data=login_data,
-                allow_redirects=True
+                allow_redirects=True,
+                timeout=15
             )
             
             # Verificar si el login fue exitoso
             if 'logout' in response.text.lower() or '/decks' in response.url:
-                return True
+                self.logged_in = True
+                return True, "Login exitoso"
             
-            return False
+            # Verificar errores específicos
+            if 'invalid' in response.text.lower() or 'incorrect' in response.text.lower():
+                return False, "Credenciales inválidas"
             
+            return False, "Login fallido por razón desconocida"
+            
+        except requests.Timeout:
+            return False, "Timeout al conectar con AnkiWeb"
         except requests.RequestException as e:
-            st.error(f"Error de conexión durante login: {str(e)}")
-            return False
+            return False, f"Error de conexión: {str(e)}"
     
-    def get_review_stats(self) -> dict:
+    def get_decks_data(self) -> Tuple[List[Dict], str]:
         """
-        Obtiene las estadísticas de repaso del usuario logueado.
+        Obtiene datos de todos los mazos desde la tabla de AnkiWeb.
         
         Returns:
-            Diccionario con 'review_count' (repasadas hoy) y 'due_count' (pendientes)
+            Tuple (lista de mazos, mensaje de error si hay)
         """
-        stats = {
-            'review_count': 0,
-            'due_count': 0,
-            'success': False
-        }
+        decks = []
+        
+        if not self.logged_in:
+            return decks, "No hay sesión activa"
         
         try:
-            response = self.session.get(self.STATS_URL)
+            response = self.session.get(self.DECKS_URL, timeout=15)
             response.raise_for_status()
             
             soup = BeautifulSoup(response.text, 'html.parser')
             
-            # Buscar estadísticas en la página
-            # Nota: La estructura HTML de AnkiWeb puede cambiar
-            
-            # Método 1: Buscar en elementos de estadísticas
-            stats_elements = soup.find_all(['span', 'div'], class_=re.compile(r'stat|count|due|review', re.I))
-            
-            for elem in stats_elements:
-                text = elem.get_text(strip=True).lower()
-                # Buscar números asociados a "reviewed" o "due"
-                if 'review' in text:
-                    numbers = re.findall(r'\d+', text)
-                    if numbers:
-                        stats['review_count'] = int(numbers[0])
-                elif 'due' in text:
-                    numbers = re.findall(r'\d+', text)
-                    if numbers:
-                        stats['due_count'] = int(numbers[0])
-            
-            # Método 2: Buscar en tabla de mazos
+            # Buscar la tabla de mazos
             deck_table = soup.find('table', {'id': 'decks'})
+            
+            if not deck_table:
+                # Buscar cualquier tabla con clase que contenga 'deck'
+                deck_table = soup.find('table', class_=re.compile(r'deck', re.I))
+            
             if deck_table:
                 rows = deck_table.find_all('tr')
-                total_due = 0
+                
                 for row in rows:
                     cols = row.find_all('td')
-                    if len(cols) >= 3:
-                        # Típicamente: Nombre | Due | New
+                    
+                    if len(cols) >= 2:
+                        # Estructura típica: Nombre | Due | New (o similar)
+                        deck_name_elem = cols[0]
+                        
+                        # Obtener nombre del mazo (puede estar en un enlace)
+                        link = deck_name_elem.find('a')
+                        deck_name = link.get_text(strip=True) if link else deck_name_elem.get_text(strip=True)
+                        
+                        # Extraer números de las columnas restantes
+                        due_count = 0
+                        new_count = 0
+                        review_count = 0
+                        
+                        for i, col in enumerate(cols[1:], start=1):
+                            text = col.get_text(strip=True)
+                            # Extraer solo números
+                            numbers = re.findall(r'\d+', text)
+                            if numbers:
+                                num = int(numbers[0])
+                                if i == 1:
+                                    due_count = num
+                                elif i == 2:
+                                    new_count = num
+                                elif i == 3:
+                                    review_count = num
+                        
+                        if deck_name:
+                            decks.append({
+                                'name': deck_name,
+                                'due': due_count,
+                                'new': new_count,
+                                'reviews': review_count
+                            })
+            
+            # Método alternativo: buscar en scripts JSON
+            if not decks:
+                scripts = soup.find_all('script')
+                for script in scripts:
+                    if script.string and 'decks' in script.string.lower():
+                        # Intentar extraer datos JSON
                         try:
-                            due_text = cols[1].get_text(strip=True)
-                            due_num = int(re.sub(r'\D', '', due_text) or '0')
-                            total_due += due_num
-                        except (ValueError, IndexError):
+                            import json
+                            matches = re.findall(r'\{[^{}]*"name"[^{}]*\}', script.string)
+                            for match in matches:
+                                data = json.loads(match)
+                                if 'name' in data:
+                                    decks.append({
+                                        'name': data.get('name', ''),
+                                        'due': data.get('due', 0),
+                                        'new': data.get('new', 0),
+                                        'reviews': data.get('reviews', 0)
+                                    })
+                        except:
                             continue
-                stats['due_count'] = total_due
             
-            # Método 3: Buscar en scripts JSON embebidos
-            scripts = soup.find_all('script')
-            for script in scripts:
-                if script.string and 'review' in script.string.lower():
-                    # Buscar patrones como "reviewed": 123
-                    reviewed_match = re.search(r'"reviewed?":\s*(\d+)', script.string)
-                    if reviewed_match:
-                        stats['review_count'] = int(reviewed_match.group(1))
-                    due_match = re.search(r'"due":\s*(\d+)', script.string)
-                    if due_match:
-                        stats['due_count'] = int(due_match.group(1))
+            return decks, ""
             
-            stats['success'] = True
-            
+        except requests.Timeout:
+            return [], "Timeout al obtener mazos"
         except requests.RequestException as e:
-            st.error(f"Error obteniendo estadísticas: {str(e)}")
+            return [], f"Error de conexión: {str(e)}"
+    
+    def get_stats_by_course(self, cursos: List[str]) -> Dict[str, Dict[str, int]]:
+        """
+        Obtiene estadísticas agrupadas por curso.
+        
+        Args:
+            cursos: Lista de nombres de cursos
+            
+        Returns:
+            Dict {curso: {'due': int, 'reviews': int, 'new': int}}
+        """
+        stats = {curso: {'due': 0, 'reviews': 0, 'new': 0} for curso in cursos}
+        stats['_total'] = {'due': 0, 'reviews': 0, 'new': 0}
+        
+        decks, error = self.get_decks_data()
+        
+        if error:
+            return stats
+        
+        for deck in decks:
+            deck_name = deck['name']
+            
+            # Sumar al total
+            stats['_total']['due'] += deck['due']
+            stats['_total']['reviews'] += deck['reviews']
+            stats['_total']['new'] += deck['new']
+            
+            # Clasificar por curso
+            for curso in cursos:
+                if match_course_in_deck(deck_name, curso):
+                    stats[curso]['due'] += deck['due']
+                    stats[curso]['reviews'] += deck['reviews']
+                    stats[curso]['new'] += deck['new']
+                    break  # Un mazo solo pertenece a un curso
         
         return stats
     
     def logout(self):
         """Cierra la sesión actual."""
-        try:
-            self.session.get(f"{self.BASE_URL}/account/logout")
-        except:
-            pass
-        finally:
-            self.session = requests.Session()
+        if self.logged_in:
+            try:
+                self.session.get(f"{self.BASE_URL}/account/logout", timeout=5)
+            except:
+                pass
+        self.session = requests.Session()
+        self.logged_in = False
 
 
-def fetch_anki_stats_for_students(students_list: list) -> dict:
+def fetch_anki_stats_all_students(students_list: List[Dict], cursos: List[str]) -> Dict[str, Dict]:
     """
-    Obtiene estadísticas de AnkiWeb para múltiples estudiantes.
+    Obtiene estadísticas de AnkiWeb para todos los estudiantes por curso.
     
     Args:
-        students_list: Lista de diccionarios con 'name', 'username', 'password'
+        students_list: Lista de diccionarios con credenciales
+        cursos: Lista de cursos para agrupar
         
     Returns:
-        Diccionario {nombre_estudiante: {'review_count': int, 'due_count': int}}
+        Dict {nombre_estudiante: {curso: {'due': int, 'reviews': int}}}
     """
     results = {}
-    scraper = AnkiWebScraper()
+    
+    if not students_list:
+        return results
     
     progress_bar = st.progress(0)
     status_text = st.empty()
     
     for i, student in enumerate(students_list):
-        name = student.get('name', 'Desconocido')
+        name = student.get('name', f'Estudiante {i+1}')
         username = student.get('username', '')
         password = student.get('password', '')
         
-        status_text.text(f"📚 Obteniendo datos de Anki para: {name}...")
+        status_text.text(f"📚 Conectando con AnkiWeb: {name}...")
         
         if not username or not password:
-            results[name] = {'review_count': 0, 'due_count': 0, 'error': 'Credenciales faltantes'}
+            # Inicializar con ceros
+            results[name] = {curso: {'due': 0, 'reviews': 0, 'new': 0} for curso in cursos}
+            results[name]['_total'] = {'due': 0, 'reviews': 0, 'new': 0}
+            results[name]['_error'] = 'Credenciales faltantes'
             continue
         
+        scraper = AnkiWebScraper()
+        
         try:
-            if scraper.login(username, password):
-                stats = scraper.get_review_stats()
-                results[name] = {
-                    'review_count': stats.get('review_count', 0),
-                    'due_count': stats.get('due_count', 0),
-                    'error': None
-                }
+            success, message = scraper.login(username, password)
+            
+            if success:
+                stats = scraper.get_stats_by_course(cursos)
+                results[name] = stats
+                results[name]['_error'] = None
             else:
-                results[name] = {'review_count': 0, 'due_count': 0, 'error': 'Login fallido'}
+                results[name] = {curso: {'due': 0, 'reviews': 0, 'new': 0} for curso in cursos}
+                results[name]['_total'] = {'due': 0, 'reviews': 0, 'new': 0}
+                results[name]['_error'] = message
+                
         except Exception as e:
-            results[name] = {'review_count': 0, 'due_count': 0, 'error': str(e)}
+            results[name] = {curso: {'due': 0, 'reviews': 0, 'new': 0} for curso in cursos}
+            results[name]['_total'] = {'due': 0, 'reviews': 0, 'new': 0}
+            results[name]['_error'] = str(e)
         finally:
             scraper.logout()
-            time.sleep(1)  # Pausa entre requests para evitar rate limiting
+            time.sleep(1)  # Rate limiting
         
         progress_bar.progress((i + 1) / len(students_list))
     
@@ -239,157 +374,263 @@ def fetch_anki_stats_for_students(students_list: list) -> dict:
 
 
 # ============================================================================
-# INTEGRACIÓN CON NOTION
+# INTEGRACIÓN CON NOTION - VERSIÓN CORREGIDA
 # ============================================================================
 
-def get_notion_client() -> Client:
+def get_notion_client() -> Optional[Client]:
     """
     Crea un cliente de Notion usando el token de los secretos.
     
     Returns:
-        Cliente de Notion autenticado
+        Cliente de Notion autenticado o None si hay error
     """
-    notion_token = st.secrets.get("NOTION_TOKEN", "")
+    notion_token = safe_get_secret("NOTION_TOKEN", "")
+    
     if not notion_token:
-        st.error("⚠️ Token de Notion no configurado en secrets")
         return None
-    return Client(auth=notion_token)
-
-
-def fetch_notion_scores(database_id: str = None) -> dict:
-    """
-    Obtiene y suma los puntajes de exámenes desde Notion.
-    
-    Args:
-        database_id: ID de la base de datos de Notion (opcional, usa el default)
-        
-    Returns:
-        Diccionario {nombre_estudiante: puntaje_total}
-    """
-    notion = get_notion_client()
-    if not notion:
-        return {}
-    
-    db_id = database_id or st.secrets.get("NOTION_DATABASE_ID", NOTION_DATABASE_ID)
-    
-    if db_id == "TU_DATABASE_ID_AQUI":
-        st.warning("⚠️ Configura el ID de la base de datos de Notion en secrets")
-        return {}
-    
-    scores = {}
     
     try:
-        # Consultar la base de datos
+        return Client(auth=notion_token)
+    except Exception as e:
+        st.error(f"❌ Error al crear cliente de Notion: {str(e)}")
+        return None
+
+
+def fetch_notion_scores_by_course(cursos: List[str]) -> Dict[str, Dict[str, float]]:
+    """
+    Obtiene y suma los puntajes de exámenes desde Notion, filtrados por curso.
+    
+    Args:
+        cursos: Lista de cursos para filtrar
+        
+    Returns:
+        Dict {nombre_estudiante: {curso: puntaje}}
+    """
+    scores = {}
+    
+    notion = get_notion_client()
+    if not notion:
+        st.warning("⚠️ Token de Notion no configurado. Los puntajes de quices mostrarán 0.")
+        return scores
+    
+    db_id = safe_get_secret("NOTION_DATABASE_ID", DEFAULT_NOTION_DATABASE_ID)
+    
+    if db_id == DEFAULT_NOTION_DATABASE_ID:
+        st.warning("⚠️ ID de base de datos de Notion no configurado.")
+        return scores
+    
+    try:
+        # Consultar la base de datos usando el método correcto
         has_more = True
         start_cursor = None
         
         while has_more:
-            query_params = {"database_id": db_id}
+            # Usar el método correcto de la API de Notion
             if start_cursor:
-                query_params["start_cursor"] = start_cursor
-            
-            response = notion.databases.query(**query_params)
+                response = notion.databases.query(
+                    database_id=db_id,
+                    start_cursor=start_cursor
+                )
+            else:
+                response = notion.databases.query(database_id=db_id)
             
             for page in response.get('results', []):
                 properties = page.get('properties', {})
                 
                 # Buscar el nombre del estudiante
-                # La propiedad puede llamarse "Nombre", "Estudiante", "Name", etc.
                 student_name = None
-                for prop_name in ['Nombre', 'Estudiante', 'Name', 'Student', 'Alumno']:
+                for prop_name in ['Nombre', 'Estudiante', 'Name', 'Student', 'Alumno', 'Participante']:
                     if prop_name in properties:
                         prop = properties[prop_name]
-                        if prop.get('type') == 'title':
+                        prop_type = prop.get('type', '')
+                        
+                        if prop_type == 'title':
                             title_content = prop.get('title', [])
                             if title_content:
                                 student_name = title_content[0].get('text', {}).get('content', '')
-                        elif prop.get('type') == 'rich_text':
+                        elif prop_type == 'rich_text':
                             text_content = prop.get('rich_text', [])
                             if text_content:
                                 student_name = text_content[0].get('text', {}).get('content', '')
-                        break
+                        elif prop_type == 'people':
+                            people = prop.get('people', [])
+                            if people:
+                                student_name = people[0].get('name', '')
+                        
+                        if student_name:
+                            break
                 
                 if not student_name:
                     continue
                 
-                # Buscar el puntaje
-                # La propiedad puede llamarse "Puntaje", "Score", "Puntos", etc.
-                score = 0
-                for prop_name in ['Puntaje', 'Score', 'Puntos', 'Points', 'Calificacion', 'Nota']:
+                # Inicializar estudiante si no existe
+                if student_name not in scores:
+                    scores[student_name] = {curso: 0.0 for curso in cursos}
+                    scores[student_name]['_total'] = 0.0
+                
+                # Buscar el curso
+                curso_encontrado = None
+                for prop_name in ['Curso', 'Course', 'Materia', 'Subject', 'Asignatura']:
                     if prop_name in properties:
                         prop = properties[prop_name]
-                        if prop.get('type') == 'number':
+                        prop_type = prop.get('type', '')
+                        
+                        if prop_type == 'select':
+                            select_data = prop.get('select', {})
+                            if select_data:
+                                curso_encontrado = select_data.get('name', '')
+                        elif prop_type == 'rich_text':
+                            text_content = prop.get('rich_text', [])
+                            if text_content:
+                                curso_encontrado = text_content[0].get('text', {}).get('content', '')
+                        elif prop_type == 'title':
+                            title_content = prop.get('title', [])
+                            if title_content:
+                                curso_encontrado = title_content[0].get('text', {}).get('content', '')
+                        
+                        if curso_encontrado:
+                            break
+                
+                # Buscar el puntaje
+                score = 0.0
+                for prop_name in ['Puntaje', 'Score', 'Puntos', 'Points', 'Calificacion', 'Nota', 'Resultado']:
+                    if prop_name in properties:
+                        prop = properties[prop_name]
+                        prop_type = prop.get('type', '')
+                        
+                        if prop_type == 'number':
                             score = prop.get('number', 0) or 0
-                        elif prop.get('type') == 'formula':
+                        elif prop_type == 'formula':
                             formula_result = prop.get('formula', {})
                             if formula_result.get('type') == 'number':
                                 score = formula_result.get('number', 0) or 0
-                        break
+                        elif prop_type == 'rollup':
+                            rollup_result = prop.get('rollup', {})
+                            if rollup_result.get('type') == 'number':
+                                score = rollup_result.get('number', 0) or 0
+                        
+                        if score:
+                            break
                 
-                # Sumar al acumulador del estudiante
-                if student_name not in scores:
-                    scores[student_name] = 0
-                scores[student_name] += score
+                # Sumar al curso correspondiente
+                if curso_encontrado:
+                    # Buscar match con cursos configurados
+                    for curso in cursos:
+                        if normalize_text(curso) in normalize_text(curso_encontrado) or \
+                           normalize_text(curso_encontrado) in normalize_text(curso):
+                            scores[student_name][curso] += score
+                            break
+                
+                # Siempre sumar al total
+                scores[student_name]['_total'] += score
             
             has_more = response.get('has_more', False)
             start_cursor = response.get('next_cursor')
     
+    except AttributeError as e:
+        st.error(f"❌ Error de API de Notion: {str(e)}. Verifica la versión de notion-client.")
     except Exception as e:
-        st.error(f"❌ Error al consultar Notion: {str(e)}")
+        error_msg = str(e)
+        if 'unauthorized' in error_msg.lower():
+            st.error("❌ Token de Notion inválido o sin permisos para esta base de datos.")
+        elif 'not_found' in error_msg.lower():
+            st.error("❌ Base de datos de Notion no encontrada. Verifica el ID.")
+        else:
+            st.error(f"❌ Error al consultar Notion: {error_msg}")
     
     return scores
 
 
 # ============================================================================
-# CÁLCULO DE PUNTAJES
+# CÁLCULO DE PUNTAJES POR CURSO
 # ============================================================================
 
-def calculate_total_scores(anki_data: dict, notion_data: dict) -> pd.DataFrame:
+def calculate_scores_by_course(
+    anki_data: Dict[str, Dict],
+    notion_data: Dict[str, Dict[str, float]],
+    cursos: List[str]
+) -> Dict[str, pd.DataFrame]:
     """
-    Calcula el puntaje total combinando datos de Anki y Notion.
+    Calcula el puntaje total por curso para todos los estudiantes.
     
-    Fórmula: (Tarjetas Anki * 0.5) + (Puntos Notion * 10) = Score Total
+    Fórmula por curso: (Tarjetas Mazo Curso * 0.5) + (Puntos Quices Curso * 10)
     
-    Args:
-        anki_data: Diccionario con estadísticas de Anki por estudiante
-        notion_data: Diccionario con puntajes de Notion por estudiante
-        
     Returns:
-        DataFrame ordenado de mayor a menor puntaje
+        Dict {nombre_curso: DataFrame ordenado}
     """
     # Combinar todos los nombres de estudiantes
     all_students = set(anki_data.keys()) | set(notion_data.keys())
     
-    data = []
+    results = {}
+    
+    # DataFrame para cada curso
+    for curso in cursos:
+        data = []
+        
+        for student in all_students:
+            anki_info = anki_data.get(student, {})
+            notion_info = notion_data.get(student, {})
+            
+            # Obtener stats del curso específico (con fallback seguro)
+            curso_anki = anki_info.get(curso, {'due': 0, 'reviews': 0, 'new': 0})
+            anki_reviews = curso_anki.get('reviews', 0) + curso_anki.get('due', 0)
+            
+            notion_score = notion_info.get(curso, 0) if isinstance(notion_info, dict) else 0
+            
+            # Calcular puntuación
+            anki_points = anki_reviews * ANKI_MULTIPLIER
+            notion_points = notion_score * NOTION_MULTIPLIER
+            total_score = anki_points + notion_points
+            
+            data.append({
+                'Estudiante': student,
+                'Tarjetas': anki_reviews,
+                'Pts Anki': round(anki_points, 1),
+                'Quices': notion_score,
+                'Pts Notion': round(notion_points, 1),
+                'Score': round(total_score, 1)
+            })
+        
+        df = pd.DataFrame(data)
+        if not df.empty:
+            df = df.sort_values('Score', ascending=False).reset_index(drop=True)
+            df.index = df.index + 1
+        results[curso] = df
+    
+    # DataFrame para ranking general
+    general_data = []
     for student in all_students:
         anki_info = anki_data.get(student, {})
-        anki_reviews = anki_info.get('review_count', 0) if isinstance(anki_info, dict) else 0
-        anki_due = anki_info.get('due_count', 0) if isinstance(anki_info, dict) else 0
-        notion_score = notion_data.get(student, 0)
+        notion_info = notion_data.get(student, {})
         
-        # Calcular puntaje total
+        # Total de Anki
+        total_anki = anki_info.get('_total', {})
+        anki_reviews = total_anki.get('reviews', 0) + total_anki.get('due', 0) if isinstance(total_anki, dict) else 0
+        
+        # Total de Notion
+        notion_score = notion_info.get('_total', 0) if isinstance(notion_info, dict) else 0
+        
+        # Calcular puntuación
         anki_points = anki_reviews * ANKI_MULTIPLIER
         notion_points = notion_score * NOTION_MULTIPLIER
         total_score = anki_points + notion_points
         
-        data.append({
+        general_data.append({
             'Estudiante': student,
-            'Tarjetas Anki': anki_reviews,
-            'Pendientes': anki_due,
-            'Puntos Anki': round(anki_points, 1),
-            'Quices Notion': notion_score,
-            'Puntos Notion': round(notion_points, 1),
+            'Tarjetas Total': anki_reviews,
+            'Pts Anki': round(anki_points, 1),
+            'Quices Total': notion_score,
+            'Pts Notion': round(notion_points, 1),
             'Score Total': round(total_score, 1)
         })
     
-    df = pd.DataFrame(data)
+    df_general = pd.DataFrame(general_data)
+    if not df_general.empty:
+        df_general = df_general.sort_values('Score Total', ascending=False).reset_index(drop=True)
+        df_general.index = df_general.index + 1
+    results['_general'] = df_general
     
-    if not df.empty:
-        df = df.sort_values('Score Total', ascending=False).reset_index(drop=True)
-        df.index = df.index + 1  # Rankings empiezan en 1
-        df.index.name = 'Rank'
-    
-    return df
+    return results
 
 
 # ============================================================================
@@ -399,7 +640,7 @@ def calculate_total_scores(anki_data: dict, notion_data: dict) -> pd.DataFrame:
 def setup_page_config():
     """Configura la página de Streamlit."""
     st.set_page_config(
-        page_title="🏆 Leaderboard - Grupo de Estudio",
+        page_title="🏆 Dashboard Multi-Curso",
         page_icon="🏆",
         layout="wide",
         initial_sidebar_state="expanded"
@@ -407,67 +648,64 @@ def setup_page_config():
 
 
 def apply_custom_css():
-    """Aplica estilos CSS personalizados para un diseño moderno."""
+    """Aplica estilos CSS personalizados."""
     st.markdown("""
     <style>
-        /* Tema oscuro y limpio */
         .stApp {
-            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            background: linear-gradient(135deg, #0f0f23 0%, #1a1a3e 100%);
         }
         
-        /* Contenedor principal */
-        .main .block-container {
-            padding-top: 2rem;
-            padding-bottom: 2rem;
-        }
-        
-        /* Título principal */
         .main-title {
             text-align: center;
-            background: linear-gradient(90deg, #00d2ff, #3a7bd5);
+            background: linear-gradient(90deg, #00d2ff, #3a7bd5, #00d2ff);
+            background-size: 200% auto;
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
-            font-size: 3rem;
+            font-size: 2.8rem;
             font-weight: 800;
             margin-bottom: 0.5rem;
-            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+            animation: gradient 3s linear infinite;
+        }
+        
+        @keyframes gradient {
+            0% { background-position: 0% center; }
+            100% { background-position: 200% center; }
         }
         
         .subtitle {
             text-align: center;
             color: #a0a0a0;
             font-size: 1.1rem;
-            margin-bottom: 2rem;
+            margin-bottom: 1.5rem;
         }
         
-        /* Cards de métricas */
-        .metric-container {
+        .metric-card {
             background: rgba(255, 255, 255, 0.05);
             border-radius: 15px;
-            padding: 1.5rem;
+            padding: 1.2rem;
             border: 1px solid rgba(255, 255, 255, 0.1);
-            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
-            backdrop-filter: blur(10px);
-            transition: transform 0.3s ease;
+            text-align: center;
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
         }
         
-        .metric-container:hover {
+        .metric-card:hover {
             transform: translateY(-5px);
+            box-shadow: 0 10px 30px rgba(0, 210, 255, 0.2);
         }
         
-        /* Tabla de leaderboard */
-        .dataframe {
-            background: rgba(255, 255, 255, 0.05) !important;
-            border-radius: 10px;
-            overflow: hidden;
+        .podium-card {
+            background: rgba(255, 255, 255, 0.03);
+            border-radius: 20px;
+            padding: 1.5rem;
+            text-align: center;
+            border: 2px solid transparent;
+            transition: all 0.3s ease;
         }
         
-        /* Medallas para el podio */
-        .gold { color: #FFD700; }
-        .silver { color: #C0C0C0; }
-        .bronze { color: #CD7F32; }
+        .gold { border-color: #FFD700; box-shadow: 0 0 20px rgba(255, 215, 0, 0.3); }
+        .silver { border-color: #C0C0C0; box-shadow: 0 0 15px rgba(192, 192, 192, 0.3); }
+        .bronze { border-color: #CD7F32; box-shadow: 0 0 10px rgba(205, 127, 50, 0.3); }
         
-        /* Botón de actualizar */
         .stButton > button {
             background: linear-gradient(90deg, #00d2ff, #3a7bd5);
             color: white;
@@ -484,204 +722,154 @@ def apply_custom_css():
             box-shadow: 0 6px 20px rgba(0, 210, 255, 0.5);
         }
         
-        /* Sidebar */
-        .css-1d391kg {
-            background: rgba(26, 26, 46, 0.95);
+        .stTabs [data-baseweb="tab-list"] {
+            gap: 8px;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 10px;
+            padding: 5px;
         }
         
-        /* Footer */
-        .footer {
-            text-align: center;
-            color: #666;
-            padding: 2rem;
-            font-size: 0.9rem;
+        .stTabs [data-baseweb="tab"] {
+            border-radius: 8px;
+            color: #888;
+            font-weight: 500;
         }
         
-        /* Responsive */
+        .stTabs [aria-selected="true"] {
+            background: linear-gradient(90deg, #00d2ff, #3a7bd5);
+            color: white !important;
+        }
+        
         @media (max-width: 768px) {
-            .main-title {
-                font-size: 2rem;
-            }
-            .metric-container {
-                padding: 1rem;
-            }
+            .main-title { font-size: 1.8rem; }
+            .metric-card { padding: 0.8rem; }
         }
     </style>
     """, unsafe_allow_html=True)
 
 
 def render_header():
-    """Renderiza el encabezado de la aplicación."""
-    st.markdown('<h1 class="main-title">🏆 Leaderboard de Estudio</h1>', unsafe_allow_html=True)
-    st.markdown('<p class="subtitle">Grupo de Medicina • Seguimiento de Anki + Quices</p>', unsafe_allow_html=True)
+    """Renderiza el encabezado."""
+    st.markdown('<h1 class="main-title">🏆 Dashboard de Competencia</h1>', unsafe_allow_html=True)
+    st.markdown(f'<p class="subtitle">Grupo de Medicina • {len(CURSOS)} Cursos Activos</p>', unsafe_allow_html=True)
 
 
-def render_podium(df: pd.DataFrame):
+def render_podium(df: pd.DataFrame, curso: str = "General"):
     """Renderiza el podio con los Top 3."""
     if df.empty or len(df) < 1:
+        st.info("No hay datos para mostrar el podio.")
         return
     
-    st.markdown("### 🥇 Podio de Honor")
+    score_col = 'Score Total' if 'Score Total' in df.columns else 'Score'
+    
+    st.markdown(f"### 🏆 Top 3 - {curso}")
     
     cols = st.columns(3)
-    
     medals = ['🥇', '🥈', '🥉']
     colors = ['#FFD700', '#C0C0C0', '#CD7F32']
+    css_classes = ['gold', 'silver', 'bronze']
     
-    # Orden: 2do, 1ro, 3ro para efecto visual
-    display_order = [1, 0, 2] if len(df) >= 3 else range(len(df))
+    display_order = [1, 0, 2] if len(df) >= 3 else list(range(min(3, len(df))))
     
-    for i, idx in enumerate(display_order):
-        if idx >= len(df):
+    for col_idx, pos_idx in enumerate(display_order):
+        if pos_idx >= len(df):
             continue
             
-        with cols[i]:
-            row = df.iloc[idx]
-            col_order = 1 if idx == 0 else (0 if idx == 1 else 2)
+        with cols[col_idx]:
+            row = df.iloc[pos_idx]
+            score = row[score_col]
             
             st.markdown(f"""
-            <div class="metric-container" style="text-align: center; border-top: 3px solid {colors[idx]};">
-                <div style="font-size: 2.5rem;">{medals[idx]}</div>
-                <div style="font-size: 1.3rem; font-weight: bold; color: white; margin: 0.5rem 0;">
+            <div class="podium-card {css_classes[pos_idx]}">
+                <div style="font-size: 2.5rem;">{medals[pos_idx]}</div>
+                <div style="font-size: 1.2rem; font-weight: bold; color: white; margin: 0.5rem 0;">
                     {row['Estudiante']}
                 </div>
-                <div style="font-size: 2rem; color: {colors[idx]}; font-weight: bold;">
-                    {row['Score Total']} pts
-                </div>
-                <div style="font-size: 0.9rem; color: #888; margin-top: 0.5rem;">
-                    📚 {row['Tarjetas Anki']} tarjetas • 📝 {row['Quices Notion']} quices
+                <div style="font-size: 1.8rem; color: {colors[pos_idx]}; font-weight: bold;">
+                    {score} pts
                 </div>
             </div>
             """, unsafe_allow_html=True)
 
 
 def render_leaderboard_table(df: pd.DataFrame):
-    """Renderiza la tabla completa del leaderboard."""
+    """Renderiza la tabla del leaderboard."""
     if df.empty:
-        st.info("📊 No hay datos para mostrar. Haz clic en 'Actualizar Datos' para comenzar.")
+        st.info("📊 No hay datos para mostrar.")
         return
     
     st.markdown("### 📊 Clasificación Completa")
     
-    # Agregar emojis a las posiciones
     df_display = df.copy()
     
     def get_rank_icon(rank):
         icons = {1: '🥇', 2: '🥈', 3: '🥉'}
         return icons.get(rank, f'{rank}°')
     
-    df_display['Pos'] = [get_rank_icon(i+1) for i in range(len(df_display))]
+    df_display.insert(0, 'Pos', [get_rank_icon(i+1) for i in range(len(df_display))])
     
-    # Reordenar columnas
-    cols_order = ['Pos', 'Estudiante', 'Score Total', 'Tarjetas Anki', 'Puntos Anki', 'Quices Notion', 'Puntos Notion', 'Pendientes']
-    df_display = df_display[[c for c in cols_order if c in df_display.columns]]
-    
-    # Mostrar tabla con estilo
-    st.dataframe(
-        df_display,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            'Pos': st.column_config.TextColumn('🏆', width=60),
-            'Estudiante': st.column_config.TextColumn('Estudiante', width=150),
-            'Score Total': st.column_config.NumberColumn('Score Total', format="%.1f ⭐"),
-            'Tarjetas Anki': st.column_config.NumberColumn('📚 Anki', help='Tarjetas repasadas hoy'),
-            'Puntos Anki': st.column_config.NumberColumn('Pts Anki', format="%.1f"),
-            'Quices Notion': st.column_config.NumberColumn('📝 Quices', help='Puntaje total en quices'),
-            'Puntos Notion': st.column_config.NumberColumn('Pts Notion', format="%.1f"),
-            'Pendientes': st.column_config.NumberColumn('⏳ Due', help='Tarjetas pendientes')
-        }
-    )
+    st.dataframe(df_display, use_container_width=True, hide_index=True)
 
 
-def render_stats_summary(df: pd.DataFrame):
-    """Renderiza un resumen de estadísticas del grupo."""
+def render_stats_summary(df: pd.DataFrame, curso: str = "General"):
+    """Renderiza estadísticas resumidas."""
     if df.empty:
         return
     
-    st.markdown("### 📈 Estadísticas del Grupo")
+    score_col = 'Score Total' if 'Score Total' in df.columns else 'Score'
+    tarjetas_col = 'Tarjetas Total' if 'Tarjetas Total' in df.columns else 'Tarjetas'
     
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
-        st.metric(
-            "👥 Estudiantes",
-            len(df),
-            help="Total de participantes"
-        )
+        st.metric("👥 Participantes", len(df))
     
     with col2:
-        avg_score = df['Score Total'].mean()
-        st.metric(
-            "📊 Promedio",
-            f"{avg_score:.1f} pts",
-            help="Puntaje promedio del grupo"
-        )
+        avg = df[score_col].mean()
+        st.metric("📊 Promedio", f"{avg:.1f} pts")
     
     with col3:
-        total_cards = df['Tarjetas Anki'].sum()
-        st.metric(
-            "📚 Total Tarjetas",
-            f"{total_cards:,}",
-            help="Tarjetas repasadas por todo el grupo"
-        )
+        total = df[tarjetas_col].sum() if tarjetas_col in df.columns else 0
+        st.metric("📚 Tarjetas", f"{total:,}")
     
     with col4:
-        total_pending = df['Pendientes'].sum()
-        st.metric(
-            "⏳ Pendientes",
-            f"{total_pending:,}",
-            help="Total de tarjetas pendientes"
-        )
+        max_score = df[score_col].max()
+        st.metric("🏆 Máximo", f"{max_score:.1f} pts")
 
 
 def render_sidebar():
-    """Renderiza la barra lateral con configuración."""
+    """Renderiza la barra lateral."""
     with st.sidebar:
         st.markdown("## ⚙️ Configuración")
         
         st.markdown("---")
         
-        st.markdown("### 📐 Fórmula de Puntaje")
-        st.code(f"Score = (Anki × {ANKI_MULTIPLIER}) + (Notion × {NOTION_MULTIPLIER})")
+        st.markdown("### 📚 Cursos Activos")
+        for curso in CURSOS:
+            st.markdown(f"• {curso}")
         
         st.markdown("---")
         
-        st.markdown("### ℹ️ Información")
-        st.markdown("""
-        **Fuentes de datos:**
-        - 📚 **AnkiWeb**: Tarjetas repasadas hoy
-        - 📝 **Notion**: Puntajes de quices
-        
-        **Actualización:**
-        Presiona el botón "Actualizar" en la página principal para obtener datos frescos.
-        """)
+        st.markdown("### 📐 Fórmula")
+        st.code(f"Score = (Anki × {ANKI_MULTIPLIER}) + (Quiz × {NOTION_MULTIPLIER})")
         
         st.markdown("---")
         
-        # Mostrar última actualización
         if 'last_update' in st.session_state:
             st.caption(f"🕐 Última actualización: {st.session_state.last_update}")
         
         st.markdown("---")
-        st.caption("Desarrollado con ❤️ para el grupo de estudio")
+        st.caption("Dashboard Multi-Curso v2.0")
 
 
-def get_students_from_secrets() -> list:
-    """
-    Obtiene la lista de estudiantes desde los secretos de Streamlit.
-    
-    Returns:
-        Lista de diccionarios con credenciales de estudiantes
-    """
+def get_students_from_secrets() -> List[Dict]:
+    """Obtiene la lista de estudiantes desde los secretos."""
     students = []
     
     try:
-        # Método 1: Lista estructurada en secrets
         if "students" in st.secrets:
             return list(st.secrets["students"])
         
-        # Método 2: Leer estudiantes individuales (student_1, student_2, etc.)
         i = 1
         while True:
             key = f"student_{i}"
@@ -696,13 +884,38 @@ def get_students_from_secrets() -> list:
             else:
                 break
     except FileNotFoundError:
-        # No hay archivo secrets.toml - esto es normal en modo demo
         pass
     except Exception:
-        # Cualquier otro error, continuar sin secretos
         pass
     
     return students
+
+
+def load_demo_data(cursos: List[str]) -> Tuple[Dict, Dict]:
+    """Genera datos de demostración."""
+    demo_students = ['Ana Martínez', 'Carlos López', 'María García', 'Luis Hernández', 'Sofia Rodríguez']
+    
+    import random
+    random.seed(42)
+    
+    anki_data = {}
+    notion_data = {}
+    
+    for student in demo_students:
+        anki_data[student] = {
+            '_total': {'due': random.randint(20, 80), 'reviews': random.randint(50, 200), 'new': random.randint(5, 30)}
+        }
+        notion_data[student] = {'_total': random.randint(60, 100)}
+        
+        for curso in cursos:
+            anki_data[student][curso] = {
+                'due': random.randint(5, 30),
+                'reviews': random.randint(20, 80),
+                'new': random.randint(2, 15)
+            }
+            notion_data[student][curso] = random.randint(0, 20)
+    
+    return anki_data, notion_data
 
 
 def main():
@@ -710,90 +923,81 @@ def main():
     setup_page_config()
     apply_custom_css()
     
-    # Inicializar estado de sesión
-    if 'leaderboard_data' not in st.session_state:
-        st.session_state.leaderboard_data = pd.DataFrame()
+    # Inicializar estado
+    if 'scores_by_course' not in st.session_state:
+        st.session_state.scores_by_course = {}
     
-    # Renderizar componentes
     render_header()
     render_sidebar()
     
-    # Contenedor principal
-    main_container = st.container()
+    # Botón de actualizar
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        if st.button("🔄 Actualizar Datos", use_container_width=True, type="primary"):
+            with st.spinner("⏳ Obteniendo datos..."):
+                try:
+                    students = get_students_from_secrets()
+                    
+                    if not students:
+                        st.warning("⚠️ No hay estudiantes configurados. Mostrando datos demo...")
+                        anki_data, notion_data = load_demo_data(CURSOS)
+                    else:
+                        anki_data = fetch_anki_stats_all_students(students, CURSOS)
+                        notion_data = fetch_notion_scores_by_course(CURSOS)
+                    
+                    scores = calculate_scores_by_course(anki_data, notion_data, CURSOS)
+                    st.session_state.scores_by_course = scores
+                    st.session_state.last_update = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    
+                    st.success("✅ Datos actualizados correctamente")
+                    
+                except Exception as e:
+                    st.error(f"❌ Error: {str(e)}")
     
-    with main_container:
-        # Botón de actualizar datos
-        col1, col2, col3 = st.columns([1, 2, 1])
-        with col2:
-            if st.button("🔄 Actualizar Datos", use_container_width=True, type="primary"):
-                with st.spinner("⏳ Recopilando datos de Anki y Notion..."):
-                    try:
-                        # Obtener lista de estudiantes desde secrets
-                        students = get_students_from_secrets()
-                        
-                        if not students:
-                            st.warning("⚠️ No hay estudiantes configurados en los secretos")
-                            # Usar datos de demostración
-                            st.info("Mostrando datos de demostración...")
-                            anki_data = {
-                                'María García': {'review_count': 150, 'due_count': 45},
-                                'Carlos Rodríguez': {'review_count': 120, 'due_count': 30},
-                                'Ana Martínez': {'review_count': 200, 'due_count': 20},
-                                'Luis Hernández': {'review_count': 80, 'due_count': 60},
-                                'Sofia López': {'review_count': 175, 'due_count': 25},
-                            }
-                            notion_data = {
-                                'María García': 85,
-                                'Carlos Rodríguez': 78,
-                                'Ana Martínez': 92,
-                                'Luis Hernández': 70,
-                                'Sofia López': 88,
-                            }
-                        else:
-                            # Obtener datos reales
-                            anki_data = fetch_anki_stats_for_students(students)
-                            notion_data = fetch_notion_scores()
-                        
-                        # Calcular puntajes
-                        df = calculate_total_scores(anki_data, notion_data)
-                        
-                        # Guardar en estado
-                        st.session_state.leaderboard_data = df
-                        st.session_state.last_update = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        
-                        st.success("✅ Datos actualizados correctamente")
-                        
-                    except Exception as e:
-                        st.error(f"❌ Error al actualizar datos: {str(e)}")
+    st.markdown("---")
+    
+    # Pestañas
+    scores = st.session_state.scores_by_course
+    
+    if scores:
+        tab_names = ["🏆 Ranking General"] + [f"📚 {curso}" for curso in CURSOS]
+        tabs = st.tabs(tab_names)
         
-        st.markdown("---")
-        
-        # Mostrar datos si existen
-        df = st.session_state.leaderboard_data
-        
-        if not df.empty:
-            render_podium(df)
+        # Tab General
+        with tabs[0]:
+            df_general = scores.get('_general', pd.DataFrame())
+            render_podium(df_general, "General")
             st.markdown("---")
-            render_stats_summary(df)
+            render_stats_summary(df_general, "General")
             st.markdown("---")
-            render_leaderboard_table(df)
-        else:
-            st.markdown("""
-            <div style="text-align: center; padding: 3rem; color: #888;">
-                <div style="font-size: 4rem; margin-bottom: 1rem;">📊</div>
-                <h3>No hay datos cargados</h3>
-                <p>Presiona el botón "Actualizar Datos" para comenzar</p>
-            </div>
-            """, unsafe_allow_html=True)
+            render_leaderboard_table(df_general)
         
-        # Footer
-        st.markdown("---")
+        # Tabs por curso
+        for i, curso in enumerate(CURSOS):
+            with tabs[i + 1]:
+                df_curso = scores.get(curso, pd.DataFrame())
+                render_podium(df_curso, curso)
+                st.markdown("---")
+                render_stats_summary(df_curso, curso)
+                st.markdown("---")
+                render_leaderboard_table(df_curso)
+    else:
         st.markdown("""
-        <div class="footer">
-            <p>📚 Fórmula: <code>(Tarjetas Anki × 0.5) + (Puntos Quices × 10) = Score Total</code></p>
-            <p>Hecho con Streamlit • Datos de AnkiWeb & Notion</p>
+        <div style="text-align: center; padding: 3rem; color: #888;">
+            <div style="font-size: 4rem; margin-bottom: 1rem;">📊</div>
+            <h3>No hay datos cargados</h3>
+            <p>Presiona "Actualizar Datos" para comenzar</p>
         </div>
         """, unsafe_allow_html=True)
+    
+    # Footer
+    st.markdown("---")
+    st.markdown(f"""
+    <div style="text-align: center; color: #666; padding: 1rem;">
+        <p>📐 <code>Score = (Tarjetas × {ANKI_MULTIPLIER}) + (Quices × {NOTION_MULTIPLIER})</code></p>
+        <p>Dashboard Multi-Curso • AnkiWeb + Notion</p>
+    </div>
+    """, unsafe_allow_html=True)
 
 
 if __name__ == "__main__":
