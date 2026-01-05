@@ -37,7 +37,7 @@ ANKI_MULTIPLIER = 0.5
 NOTION_MULTIPLIER = 10
 
 # ID de la Base de Datos de Notion (se lee de secrets si está disponible)
-DEFAULT_NOTION_DATABASE_ID = "2deb47a0104080febc59e7e445f0a048"
+DEFAULT_NOTION_DATABASE_ID = "TU_DATABASE_ID_AQUI"
 
 
 # ============================================================================
