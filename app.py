@@ -24,12 +24,13 @@ from typing import Dict, List, Optional, Tuple
 # Lista de cursos disponibles
 CURSOS = ["Fisiopatología", "Epidemiología", "Farmacología", "Patología"]
 
-# Palabras clave para buscar mazos en AnkiWeb (mapeo curso -> keywords)
-CURSO_KEYWORDS = {
-    "Fisiopatología": ["fisiopatologia", "fisiopatol", "fisiopatolog", "fisiopatolgia"],
-    "Epidemiología": ["epidemio", "epi", "bioestadística", "bioestad"],
-    "Farmacología": ["farma", "farmaco", "farmacología"],
-    "Patología": ["pato", "patología", "patologia"],
+# Nombres EXACTOS de los mazos oficiales en AnkiWeb (mapeo curso -> nombre exacto del mazo)
+# Cada estudiante DEBE tener el mazo con este nombre exacto para que se contabilice
+CURSO_DECKS_EXACTOS = {
+    "Fisiopatología": "Estudio universitario::V ciclo::Fisiopatología",
+    "Epidemiología": "Estudio universitario::V ciclo::Epidemiología",
+    "Farmacología": "Estudio universitario::V ciclo::Farmacología",
+    "Patología": "Estudio universitario::V ciclo::Patología",
 }
 
 # Multiplicadores para el cálculo de score
@@ -58,10 +59,25 @@ def normalize_text(text: str) -> str:
 
 
 def match_course_in_deck(deck_name: str, curso: str) -> bool:
-    """Verifica si el nombre de un mazo corresponde a un curso."""
-    deck_normalized = normalize_text(deck_name)
-    keywords = CURSO_KEYWORDS.get(curso, [normalize_text(curso)])
-    return any(kw in deck_normalized for kw in keywords)
+    """
+    Verifica si el nombre de un mazo coincide EXACTAMENTE con el mazo oficial del curso.
+    
+    La comparación es case-insensitive (ignora mayúsculas/minúsculas).
+    
+    Args:
+        deck_name: Nombre del mazo encontrado en AnkiWeb
+        curso: Nombre del curso a verificar
+    
+    Returns:
+        True si hay coincidencia exacta, False en caso contrario
+    """
+    nombre_mazo_oficial = CURSO_DECKS_EXACTOS.get(curso)
+    
+    if not nombre_mazo_oficial:
+        return False
+    
+    # Comparación exacta ignorando mayúsculas/minúsculas
+    return deck_name.strip().lower() == nombre_mazo_oficial.lower()
 
 
 def get_secrets() -> Tuple[Optional[str], Optional[str]]:
@@ -393,23 +409,50 @@ class AnkiWebScraper:
         return decks
     
     def get_stats_by_course(self, cursos: List[str]) -> Dict[str, Dict[str, int]]:
-        """Agrupa estadísticas por curso."""
+        """
+        Agrupa estadísticas por curso basándose en coincidencia EXACTA de nombres de mazos.
+        
+        Solo se suman tarjetas de mazos que coincidan exactamente con los nombres
+        definidos en CURSO_DECKS_EXACTOS. Si un mazo oficial no existe para un
+        estudiante, se asigna 0 puntos sin generar error.
+        
+        Args:
+            cursos: Lista de cursos a buscar
+            
+        Returns:
+            Dict con estadísticas por curso y notas internas sobre mazos faltantes
+        """
         stats = {c: {'due': 0, 'reviews': 0, 'new': 0} for c in cursos}
         stats['_total'] = {'due': 0, 'reviews': 0, 'new': 0}
+        stats['_notas_internas'] = []  # Registro de mazos no encontrados
         
         decks = self.get_decks_data()
         
+        # Crear un set de nombres de mazos encontrados (normalizados) para validación
+        mazos_encontrados = {deck['name'].strip().lower() for deck in decks}
+        
+        # Verificar qué mazos oficiales faltan y registrar nota interna
+        for curso in cursos:
+            nombre_mazo_oficial = CURSO_DECKS_EXACTOS.get(curso, "")
+            if nombre_mazo_oficial and nombre_mazo_oficial.lower() not in mazos_encontrados:
+                stats['_notas_internas'].append(
+                    f"Mazo '{nombre_mazo_oficial}' para {curso} no encontrado"
+                )
+        
+        # Procesar cada mazo encontrado
         for deck in decks:
+            # Siempre sumar al total general
             stats['_total']['due'] += deck['due']
             stats['_total']['reviews'] += deck['reviews']
             stats['_total']['new'] += deck['new']
             
+            # Solo sumar a un curso si hay coincidencia EXACTA con el mazo oficial
             for curso in cursos:
                 if match_course_in_deck(deck['name'], curso):
                     stats[curso]['due'] += deck['due']
                     stats[curso]['reviews'] += deck['reviews']
                     stats[curso]['new'] += deck['new']
-                    break
+                    break  # Un mazo solo puede pertenecer a un curso
         
         return stats
     
