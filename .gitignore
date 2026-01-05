@@ -1,0 +1,15 @@
+# Ignorar entorno virtual
+.venv/
+venv/
+env/
+
+# Ignorar archivos de secretos (MUY IMPORTANTE para seguridad)
+secrets.toml
+.env
+
+# Ignorar cache de Python
+__pycache__/
+*.pyc
+
+# Ignorar archivos del sistema
+.DS_Store

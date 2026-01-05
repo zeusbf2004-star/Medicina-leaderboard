@@ -22,10 +22,11 @@ from typing import Dict, List, Optional, Tuple
 # ============================================================================
 
 # Lista de cursos disponibles - MODIFICAR SEGÚN NECESIDAD
-CURSOS = ["Epidemiología", "Farmacología", "Patología"]
+CURSOS = ["Fisiopatología", "Epidemiología", "Farmacología", "Patología"]
 
 # Palabras clave para buscar mazos en AnkiWeb (mapeo curso -> keywords)
 CURSO_KEYWORDS = {
+    "Fisiopatología": ["fisiopatologia", "fisiopatol", "fisiopatolog", "fisiopatolgia"],
     "Epidemiología": ["epidemio", "epi", "bioestadística", "bioestad"],
     "Farmacología": ["farma", "farmaco", "farmacología"],
     "Patología": ["pato", "patología", "patologia"],
@@ -36,7 +37,7 @@ ANKI_MULTIPLIER = 0.5
 NOTION_MULTIPLIER = 10
 
 # ID de la Base de Datos de Notion (se lee de secrets si está disponible)
-DEFAULT_NOTION_DATABASE_ID = "TU_DATABASE_ID_AQUI"
+DEFAULT_NOTION_DATABASE_ID = "2deb47a0104080febc59e7e445f0a048"
 
 
 # ============================================================================
