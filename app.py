@@ -359,47 +359,81 @@ class AnkiWebScraper:
         self.logged_in = False
         self.csrf_token = ''
     
-    def _get_csrf_token(self, html: str) -> str:
-        """Extrae el token CSRF de la página."""
-        soup = BeautifulSoup(html, 'html.parser')
+    def _build_login_payload(self, email: str, password: str) -> bytes:
+        """
+        Construye el payload binario Protobuf para el login de AnkiWeb.
         
-        # Buscar en input hidden
-        csrf = soup.find('input', {'name': 'csrf_token'})
-        if csrf and csrf.get('value'):
-            return csrf.get('value', '')
+        AnkiWeb usa formato Protobuf:
+        - Campo 1 (tag 0x0A): Email
+        - Campo 2 (tag 0x12): Password
         
-        # Buscar en meta tag
-        meta = soup.find('meta', {'name': 'csrf-token'})
-        if meta and meta.get('content'):
-            return meta.get('content', '')
+        Args:
+            email: Correo electrónico del usuario
+            password: Contraseña del usuario
+            
+        Returns:
+            Bytes del payload Protobuf
+        """
+        payload = bytearray()
         
-        return ''
+        # Campo 1: Email
+        email_bytes = email.encode('utf-8')
+        payload.append(0x0A)  # Tag para campo 1 (string)
+        payload.append(len(email_bytes))
+        payload.extend(email_bytes)
+        
+        # Campo 2: Password
+        password_bytes = password.encode('utf-8')
+        payload.append(0x12)  # Tag para campo 2 (string)
+        payload.append(len(password_bytes))
+        payload.extend(password_bytes)
+        
+        return bytes(payload)
     
     def login(self, username: str, password: str) -> Tuple[bool, str]:
-        """Realiza el login en AnkiWeb."""
+        """
+        Realiza el login en AnkiWeb usando el nuevo API Protobuf.
+        
+        AnkiWeb migró a SvelteKit y ahora usa:
+        - Endpoint: /svc/account/login
+        - Content-Type: application/octet-stream
+        - Formato: Protobuf binario
+        
+        Args:
+            username: Email del usuario
+            password: Contraseña
+            
+        Returns:
+            Tuple (éxito: bool, mensaje: str)
+        """
         try:
-            # Obtener página de login y CSRF token
+            # Primero visitar la página de login para obtener cookies de sesión
             resp = self.session.get(self.LOGIN_URL, timeout=15)
             resp.raise_for_status()
             
-            self.csrf_token = self._get_csrf_token(resp.text)
+            # Construir payload binario Protobuf
+            payload = self._build_login_payload(username, password)
             
-            data = {
-                'csrf_token': self.csrf_token,
-                'submitted': '1',
-                'username': username,
-                'password': password,
+            # Nuevo endpoint de login
+            login_url = f"{self.BASE_URL}/svc/account/login"
+            
+            # Headers requeridos para el nuevo API
+            headers = {
+                'Content-Type': 'application/octet-stream',
+                'Referer': 'https://ankiweb.net/account/login',
+                'Origin': 'https://ankiweb.net',
             }
             
-            resp = self.session.post(self.LOGIN_URL, data=data, allow_redirects=True, timeout=15)
+            resp = self.session.post(login_url, data=payload, headers=headers, timeout=15)
             
-            if 'logout' in resp.text.lower() or '/decks' in resp.url:
+            # Verificar respuesta
+            if resp.status_code == 200:
                 self.logged_in = True
-                # Actualizar CSRF para siguientes requests
-                self.csrf_token = self._get_csrf_token(resp.text)
                 return True, "OK"
-            
-            return False, "Credenciales inválidas"
+            elif resp.status_code == 401 or resp.status_code == 403:
+                return False, "Credenciales inválidas"
+            else:
+                return False, f"HTTP {resp.status_code}"
             
         except requests.Timeout:
             return False, "Timeout"
