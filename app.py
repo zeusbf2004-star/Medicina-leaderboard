@@ -711,12 +711,13 @@ class AnkiWebScraper:
     
     def get_stats_by_course(self, cursos: List[str]) -> Dict[str, Dict[str, int]]:
         """
-        Obtiene estadísticas por curso buscando mazos que coincidan con palabras clave.
+        Obtiene estadísticas por curso desde la página /decks/ de AnkiWeb.
         
-        Proceso:
-        1. Obtiene todos los mazos disponibles desde /decks/
-        2. Para cada mazo, verifica si coincide con algún curso usando palabras clave
-        3. Extrae las estadísticas de los mazos que coincidan
+        Estructura real de AnkiWeb (según investigación):
+        - Cada mazo está en un div.row.light-bottom-border
+        - El nombre está en un button.btn.btn-link (NO en un <a>)
+        - Contadores: div.number.due (verde) y div.number.new (azul)
+        - NOTA: 'due' combina Review + Learning en un solo número
         
         Args:
             cursos: Lista de cursos a buscar
@@ -727,98 +728,153 @@ class AnkiWebScraper:
         stats = {c: {'review': 0, 'learning': 0, 'new': 0} for c in cursos}
         stats['_total'] = {'review': 0, 'learning': 0, 'new': 0}
         stats['_notas_internas'] = []
-        stats['_mazos_encontrados'] = []  # Para debug
+        stats['_mazos_encontrados'] = []
         
-        # Obtener todos los mazos con sus estadísticas
+        if not self.logged_in:
+            stats['_notas_internas'].append("No se ha iniciado sesión")
+            return stats
+        
         try:
             resp = self.session.get(self.DECKS_URL, timeout=15)
             resp.raise_for_status()
             
             soup = BeautifulSoup(resp.text, 'html.parser')
+            html_content = resp.text[:500]  # Para debug
+            print(f"[DEBUG] HTML recibido (primeros 500 chars): {html_content}")
             
-            # Buscar todos los elementos que podrían contener mazos
-            # AnkiWeb puede usar diferentes estructuras HTML
+            # Método 1: Buscar divs con clase 'row' que contengan mazos
+            deck_rows = soup.find_all('div', class_=re.compile(r'row.*light-bottom-border', re.I))
             
-            # Método 1: Buscar tabla con id 'decks'
-            table = soup.find('table', {'id': 'decks'})
+            if not deck_rows:
+                # Método 2: Buscar cualquier div con clase 'row'
+                deck_rows = soup.find_all('div', class_=re.compile(r'^row$|row\s', re.I))
             
-            # Método 2: Buscar cualquier tabla
-            if not table:
+            if not deck_rows:
+                # Método 3: Buscar en tabla tradicional
                 table = soup.find('table')
+                if table:
+                    deck_rows = table.find_all('tr')
             
-            if table:
-                rows = table.find_all('tr')
-                print(f"[DEBUG] Encontradas {len(rows)} filas en tabla de mazos")
+            if not deck_rows:
+                # Método 4: Buscar botones de mazos directamente
+                deck_buttons = soup.find_all('button', class_=re.compile(r'btn.*link', re.I))
+                print(f"[DEBUG] Encontrados {len(deck_buttons)} botones de mazos")
                 
-                for row in rows:
-                    cols = row.find_all('td')
-                    if len(cols) < 2:
-                        continue
-                    
-                    # Extraer nombre del mazo
-                    link = cols[0].find('a')
+                for btn in deck_buttons:
+                    deck_name = btn.get_text(strip=True)
+                    if deck_name:
+                        # Buscar contadores cercanos
+                        parent = btn.find_parent()
+                        if parent:
+                            deck_rows.append(parent)
+            
+            print(f"[DEBUG] Encontradas {len(deck_rows)} filas/elementos de mazos")
+            
+            for row in deck_rows:
+                # Extraer nombre del mazo
+                # Buscar en botón primero, luego en enlace
+                btn = row.find('button')
+                if btn:
+                    deck_name = btn.get_text(strip=True)
+                else:
+                    link = row.find('a')
                     if link:
                         deck_name = link.get_text(strip=True)
                     else:
-                        deck_name = cols[0].get_text(strip=True)
-                    
-                    if not deck_name:
-                        continue
-                    
-                    print(f"[DEBUG] Analizando mazo: '{deck_name}'")
-                    
-                    # Extraer números de las columnas
-                    numbers = []
-                    for col in cols[1:]:
-                        text = col.get_text(strip=True)
-                        nums = re.findall(r'\d+', text)
-                        if nums:
-                            numbers.append(int(nums[0]))
-                    
-                    # Asignar estadísticas según cantidad de números encontrados
-                    deck_stats = {'review': 0, 'learning': 0, 'new': 0}
-                    if len(numbers) >= 2:
-                        # Típicamente: [Due, New] o [Review, New]
-                        deck_stats['review'] = numbers[0]
-                        deck_stats['new'] = numbers[1]
-                    elif len(numbers) >= 1:
-                        deck_stats['review'] = numbers[0]
-                    
-                    # Sumar al total general
-                    stats['_total']['review'] += deck_stats['review']
-                    stats['_total']['learning'] += deck_stats['learning']
-                    stats['_total']['new'] += deck_stats['new']
-                    
-                    # Verificar si este mazo coincide con algún curso
-                    for curso in cursos:
-                        if match_course_in_deck(deck_name, curso):
-                            print(f"[DEBUG] ✓ Mazo '{deck_name}' coincide con curso '{curso}'")
-                            stats['_mazos_encontrados'].append({
-                                'mazo': deck_name,
-                                'curso': curso,
-                                'stats': deck_stats
-                            })
-                            
-                            # Sumar estadísticas al curso
-                            stats[curso]['review'] += deck_stats['review']
-                            stats[curso]['learning'] += deck_stats['learning']
-                            stats[curso]['new'] += deck_stats['new']
-                            break  # Un mazo solo puede pertenecer a un curso
-            else:
-                print("[DEBUG] No se encontró tabla de mazos")
-                stats['_notas_internas'].append("No se encontró tabla de mazos en AnkiWeb")
+                        deck_name = row.get_text(strip=True)[:50]  # Primeros 50 chars
+                
+                if not deck_name or len(deck_name) < 2:
+                    continue
+                
+                # Limpiar nombre (quitar espacios de indentación)
+                deck_name = deck_name.strip()
+                
+                print(f"[DEBUG] Mazo encontrado: '{deck_name}'")
+                
+                # Extraer contadores con clases específicas
+                due_elem = row.find(class_=re.compile(r'due|review', re.I))
+                new_elem = row.find(class_=re.compile(r'new', re.I))
+                learn_elem = row.find(class_=re.compile(r'learn', re.I))
+                
+                due = 0
+                new = 0
+                learning = 0
+                
+                if due_elem:
+                    due_text = due_elem.get_text(strip=True)
+                    due_nums = re.findall(r'\d+', due_text)
+                    if due_nums:
+                        due = int(due_nums[0])
+                
+                if new_elem:
+                    new_text = new_elem.get_text(strip=True)
+                    new_nums = re.findall(r'\d+', new_text)
+                    if new_nums:
+                        new = int(new_nums[0])
+                
+                if learn_elem:
+                    learn_text = learn_elem.get_text(strip=True)
+                    learn_nums = re.findall(r'\d+', learn_text)
+                    if learn_nums:
+                        learning = int(learn_nums[0])
+                
+                # Si no encontramos con clases específicas, buscar todos los números
+                if due == 0 and new == 0:
+                    all_nums = re.findall(r'\b(\d+)\b', row.get_text())
+                    if len(all_nums) >= 2:
+                        due = int(all_nums[0])
+                        new = int(all_nums[1])
+                    elif len(all_nums) == 1:
+                        due = int(all_nums[0])
+                
+                deck_stats = {
+                    'review': due,  # 'due' en AnkiWeb = review + learning
+                    'learning': learning,
+                    'new': new
+                }
+                
+                print(f"[DEBUG] Stats: due={due}, new={new}, learning={learning}")
+                
+                # Sumar al total general
+                stats['_total']['review'] += due
+                stats['_total']['learning'] += learning
+                stats['_total']['new'] += new
+                
+                # Verificar si este mazo coincide con algún curso
+                for curso in cursos:
+                    if match_course_in_deck(deck_name, curso):
+                        print(f"[DEBUG] ✓ COINCIDENCIA: '{deck_name}' -> '{curso}'")
+                        stats['_mazos_encontrados'].append({
+                            'mazo': deck_name,
+                            'curso': curso,
+                            'stats': deck_stats
+                        })
+                        
+                        # Sumar estadísticas al curso
+                        stats[curso]['review'] += due
+                        stats[curso]['learning'] += learning
+                        stats[curso]['new'] += new
+                        break
+            
+            if len(deck_rows) == 0:
+                stats['_notas_internas'].append("No se encontraron mazos en la página")
+                # Guardar HTML para debug
+                print(f"[DEBUG] HTML completo: {resp.text[:2000]}")
                 
         except Exception as e:
             print(f"[DEBUG] Error en get_stats_by_course: {e}")
+            import traceback
+            traceback.print_exc()
             stats['_notas_internas'].append(f"Error: {str(e)}")
         
         # Registrar cursos sin mazos encontrados
         for curso in cursos:
             if stats[curso]['review'] == 0 and stats[curso]['learning'] == 0 and stats[curso]['new'] == 0:
                 keywords = CURSO_DECK_KEYWORDS.get(curso, [])
-                stats['_notas_internas'].append(
-                    f"No se encontró mazo para '{curso}' (buscando: {', '.join(keywords[:2])}...)"
-                )
+                if keywords:
+                    stats['_notas_internas'].append(
+                        f"Sin datos para '{curso}' (buscando: {', '.join(keywords[:2])})"
+                    )
         
         return stats
     
