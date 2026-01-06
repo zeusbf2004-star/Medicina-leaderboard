@@ -28,7 +28,7 @@ CURSOS = ["Fisiopatología", "Epidemiología", "Farmacología", "Patología"]
 # Cada estudiante DEBE tener el mazo con este nombre exacto para que se contabilice
 # IMPORTANTE: Usar el nombre de la fila PRINCIPAL del mazo (incluye suma de submazos)
 CURSO_DECKS_EXACTOS = {
-    "Fisiopatología": "Fisiopatología Uribe",  # Mazo principal que contiene submazos
+    "Fisiopatología": "Estudio universitario::V ciclo::Fisiopatología::Fisiopatología Uribe",  # Mazo principal que contiene submazos
     "Epidemiología": "Epidemiología",
     "Farmacología": "Farmacología", 
     "Patología": "Patología",
