@@ -24,14 +24,14 @@ from typing import Dict, List, Optional, Tuple
 # Lista de cursos disponibles
 CURSOS = ["Fisiopatología", "Epidemiología", "Farmacología", "Patología"]
 
-# Nombres EXACTOS de los mazos oficiales en AnkiWeb (mapeo curso -> nombre exacto del mazo)
-# Cada estudiante DEBE tener el mazo con este nombre exacto para que se contabilice
-# IMPORTANTE: Usar el nombre de la fila PRINCIPAL del mazo (incluye suma de submazos)
-CURSO_DECKS_EXACTOS = {
-    "Fisiopatología": "Estudio universitario::V ciclo::Fisiopatología::Fisiopatología Uribe",  # Mazo principal que contiene submazos
-    "Epidemiología": "Epidemiología",
-    "Farmacología": "Farmacología", 
-    "Patología": "Patología",
+# Palabras clave para identificar mazos en AnkiWeb (mapeo curso -> palabras clave)
+# El sistema buscará mazos que CONTENGAN alguna de estas palabras clave
+# Esto funciona con cualquier estructura de jerarquía (::)
+CURSO_DECK_KEYWORDS = {
+    "Fisiopatología": ["fisiopatología uribe", "fisiopatologia uribe", "fisiopato uribe"],
+    "Epidemiología": ["epidemiología", "epidemiologia", "epidemio"],
+    "Farmacología": ["farmacología", "farmacologia", "farmaco"], 
+    "Patología": ["patología", "patologia", "pato"],
 }
 
 # Multiplicadores para el cálculo de score (Fórmula Médica)
@@ -66,24 +66,38 @@ def normalize_text(text: str) -> str:
 
 def match_course_in_deck(deck_name: str, curso: str) -> bool:
     """
-    Verifica si el nombre de un mazo coincide EXACTAMENTE con el mazo oficial del curso.
+    Verifica si el nombre de un mazo corresponde a un curso usando búsqueda flexible.
     
-    La comparación es case-insensitive (ignora mayúsculas/minúsculas).
+    Busca si el nombre del mazo CONTIENE alguna de las palabras clave del curso.
+    Esto permite encontrar mazos independientemente de su jerarquía (::).
+    
+    Ejemplos que funcionarían para Fisiopatología:
+    - "Fisiopatología Uribe"
+    - "Estudio universitario::V ciclo::Fisiopatología::Fisiopatología Uribe"
+    - "fisiopatologia uribe"
     
     Args:
         deck_name: Nombre del mazo encontrado en AnkiWeb
         curso: Nombre del curso a verificar
     
     Returns:
-        True si hay coincidencia exacta, False en caso contrario
+        True si el mazo contiene alguna palabra clave del curso
     """
-    nombre_mazo_oficial = CURSO_DECKS_EXACTOS.get(curso)
+    keywords = CURSO_DECK_KEYWORDS.get(curso, [])
     
-    if not nombre_mazo_oficial:
+    if not keywords:
         return False
     
-    # Comparación exacta ignorando mayúsculas/minúsculas
-    return deck_name.strip().lower() == nombre_mazo_oficial.lower()
+    # Normalizar el nombre del mazo para comparación
+    deck_normalized = normalize_text(deck_name)
+    
+    # Buscar si alguna palabra clave está contenida en el nombre del mazo
+    for keyword in keywords:
+        keyword_normalized = normalize_text(keyword)
+        if keyword_normalized in deck_normalized:
+            return True
+    
+    return False
 
 
 def get_secrets() -> Tuple[Optional[str], Optional[str]]:
@@ -697,12 +711,12 @@ class AnkiWebScraper:
     
     def get_stats_by_course(self, cursos: List[str]) -> Dict[str, Dict[str, int]]:
         """
-        Obtiene estadísticas por curso usando los nombres de mazos definidos.
+        Obtiene estadísticas por curso buscando mazos que coincidan con palabras clave.
         
-        Para cada curso, busca el mazo correspondiente y extrae:
-        - review: Tarjetas de repaso (verdes)
-        - learning: Tarjetas en aprendizaje (rojas)
-        - new: Tarjetas nuevas (azules)
+        Proceso:
+        1. Obtiene todos los mazos disponibles desde /decks/
+        2. Para cada mazo, verifica si coincide con algún curso usando palabras clave
+        3. Extrae las estadísticas de los mazos que coincidan
         
         Args:
             cursos: Lista de cursos a buscar
@@ -713,31 +727,98 @@ class AnkiWebScraper:
         stats = {c: {'review': 0, 'learning': 0, 'new': 0} for c in cursos}
         stats['_total'] = {'review': 0, 'learning': 0, 'new': 0}
         stats['_notas_internas'] = []
+        stats['_mazos_encontrados'] = []  # Para debug
         
+        # Obtener todos los mazos con sus estadísticas
+        try:
+            resp = self.session.get(self.DECKS_URL, timeout=15)
+            resp.raise_for_status()
+            
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            
+            # Buscar todos los elementos que podrían contener mazos
+            # AnkiWeb puede usar diferentes estructuras HTML
+            
+            # Método 1: Buscar tabla con id 'decks'
+            table = soup.find('table', {'id': 'decks'})
+            
+            # Método 2: Buscar cualquier tabla
+            if not table:
+                table = soup.find('table')
+            
+            if table:
+                rows = table.find_all('tr')
+                print(f"[DEBUG] Encontradas {len(rows)} filas en tabla de mazos")
+                
+                for row in rows:
+                    cols = row.find_all('td')
+                    if len(cols) < 2:
+                        continue
+                    
+                    # Extraer nombre del mazo
+                    link = cols[0].find('a')
+                    if link:
+                        deck_name = link.get_text(strip=True)
+                    else:
+                        deck_name = cols[0].get_text(strip=True)
+                    
+                    if not deck_name:
+                        continue
+                    
+                    print(f"[DEBUG] Analizando mazo: '{deck_name}'")
+                    
+                    # Extraer números de las columnas
+                    numbers = []
+                    for col in cols[1:]:
+                        text = col.get_text(strip=True)
+                        nums = re.findall(r'\d+', text)
+                        if nums:
+                            numbers.append(int(nums[0]))
+                    
+                    # Asignar estadísticas según cantidad de números encontrados
+                    deck_stats = {'review': 0, 'learning': 0, 'new': 0}
+                    if len(numbers) >= 2:
+                        # Típicamente: [Due, New] o [Review, New]
+                        deck_stats['review'] = numbers[0]
+                        deck_stats['new'] = numbers[1]
+                    elif len(numbers) >= 1:
+                        deck_stats['review'] = numbers[0]
+                    
+                    # Sumar al total general
+                    stats['_total']['review'] += deck_stats['review']
+                    stats['_total']['learning'] += deck_stats['learning']
+                    stats['_total']['new'] += deck_stats['new']
+                    
+                    # Verificar si este mazo coincide con algún curso
+                    for curso in cursos:
+                        if match_course_in_deck(deck_name, curso):
+                            print(f"[DEBUG] ✓ Mazo '{deck_name}' coincide con curso '{curso}'")
+                            stats['_mazos_encontrados'].append({
+                                'mazo': deck_name,
+                                'curso': curso,
+                                'stats': deck_stats
+                            })
+                            
+                            # Sumar estadísticas al curso
+                            stats[curso]['review'] += deck_stats['review']
+                            stats[curso]['learning'] += deck_stats['learning']
+                            stats[curso]['new'] += deck_stats['new']
+                            break  # Un mazo solo puede pertenecer a un curso
+            else:
+                print("[DEBUG] No se encontró tabla de mazos")
+                stats['_notas_internas'].append("No se encontró tabla de mazos en AnkiWeb")
+                
+        except Exception as e:
+            print(f"[DEBUG] Error en get_stats_by_course: {e}")
+            stats['_notas_internas'].append(f"Error: {str(e)}")
+        
+        # Registrar cursos sin mazos encontrados
         for curso in cursos:
-            nombre_mazo = CURSO_DECKS_EXACTOS.get(curso, "")
-            
-            if not nombre_mazo:
-                stats['_notas_internas'].append(f"No hay mazo configurado para {curso}")
-                continue
-            
-            # Intentar obtener stats desde la página de mazos primero (más rápido)
-            deck_stats = self.get_deck_stats_from_decks_page(nombre_mazo, debug=True)
-            
-            # Si no obtuvimos datos, intentar con selección de mazo
-            if deck_stats['review'] == 0 and deck_stats['learning'] == 0 and deck_stats['new'] == 0:
-                deck_stats = self.select_deck_and_get_study_counts(nombre_mazo, debug=True)
-            
-            if deck_stats['review'] == 0 and deck_stats['learning'] == 0 and deck_stats['new'] == 0:
-                stats['_notas_internas'].append(f"Mazo '{nombre_mazo}' para {curso} sin datos")
-            
-            # Guardar stats del curso
-            stats[curso] = deck_stats
-            
-            # Sumar al total
-            stats['_total']['review'] += deck_stats['review']
-            stats['_total']['learning'] += deck_stats['learning']
-            stats['_total']['new'] += deck_stats['new']
+            if stats[curso]['review'] == 0 and stats[curso]['learning'] == 0 and stats[curso]['new'] == 0:
+                keywords = CURSO_DECK_KEYWORDS.get(curso, [])
+                stats['_notas_internas'].append(
+                    f"No se encontró mazo para '{curso}' (buscando: {', '.join(keywords[:2])}...)"
+                )
         
         return stats
     
