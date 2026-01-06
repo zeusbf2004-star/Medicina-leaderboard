@@ -729,6 +729,7 @@ class AnkiWebScraper:
         stats['_total'] = {'review': 0, 'learning': 0, 'new': 0}
         stats['_notas_internas'] = []
         stats['_mazos_encontrados'] = []
+        stats['_html_preview'] = ""  # Para debug
         
         if not self.logged_in:
             stats['_notas_internas'].append("No se ha iniciado sesión")
@@ -739,26 +740,34 @@ class AnkiWebScraper:
             resp.raise_for_status()
             
             soup = BeautifulSoup(resp.text, 'html.parser')
-            html_content = resp.text[:500]  # Para debug
-            print(f"[DEBUG] HTML recibido (primeros 500 chars): {html_content}")
+            
+            # Guardar preview del HTML para debug
+            stats['_html_preview'] = resp.text[:1000]
+            stats['_notas_internas'].append(f"📡 Respuesta HTTP: {resp.status_code}")
+            stats['_notas_internas'].append(f"📄 Tamaño HTML: {len(resp.text)} chars")
             
             # Método 1: Buscar divs con clase 'row' que contengan mazos
             deck_rows = soup.find_all('div', class_=re.compile(r'row.*light-bottom-border', re.I))
+            stats['_notas_internas'].append(f"🔍 Método 1 (div.row.light-bottom-border): {len(deck_rows)} elementos")
             
             if not deck_rows:
                 # Método 2: Buscar cualquier div con clase 'row'
                 deck_rows = soup.find_all('div', class_=re.compile(r'^row$|row\s', re.I))
+                stats['_notas_internas'].append(f"🔍 Método 2 (div.row): {len(deck_rows)} elementos")
             
             if not deck_rows:
                 # Método 3: Buscar en tabla tradicional
                 table = soup.find('table')
                 if table:
                     deck_rows = table.find_all('tr')
+                    stats['_notas_internas'].append(f"🔍 Método 3 (table tr): {len(deck_rows)} elementos")
+                else:
+                    stats['_notas_internas'].append("🔍 Método 3: No se encontró tabla")
             
             if not deck_rows:
                 # Método 4: Buscar botones de mazos directamente
                 deck_buttons = soup.find_all('button', class_=re.compile(r'btn.*link', re.I))
-                print(f"[DEBUG] Encontrados {len(deck_buttons)} botones de mazos")
+                stats['_notas_internas'].append(f"🔍 Método 4 (buttons): {len(deck_buttons)} botones")
                 
                 for btn in deck_buttons:
                     deck_name = btn.get_text(strip=True)
@@ -768,7 +777,7 @@ class AnkiWebScraper:
                         if parent:
                             deck_rows.append(parent)
             
-            print(f"[DEBUG] Encontradas {len(deck_rows)} filas/elementos de mazos")
+            stats['_notas_internas'].append(f"📊 Total filas/elementos encontrados: {len(deck_rows)}")
             
             for row in deck_rows:
                 # Extraer nombre del mazo
@@ -923,8 +932,10 @@ def fetch_anki_stats(students: List[Dict], cursos: List[str]) -> Dict:
     {curso: {'review': int, 'learning': int, 'new': int}}
     """
     results = {}
+    debug_info = []  # Para mostrar info de debug
     
     if not students:
+        st.warning("No hay estudiantes configurados")
         return results
     
     progress = st.progress(0)
@@ -936,33 +947,82 @@ def fetch_anki_stats(students: List[Dict], cursos: List[str]) -> Dict:
         password = student.get('password', '')
         
         status.text(f"📚 Conectando Anki: {name}...")
+        student_debug = {"nombre": name, "pasos": []}
         
         # Estructura por defecto con review, learning, new
         default_stats = {c: {'review': 0, 'learning': 0, 'new': 0} for c in cursos}
         default_stats['_total'] = {'review': 0, 'learning': 0, 'new': 0}
         
         if not username or not password:
+            student_debug["pasos"].append("❌ Sin credenciales")
             results[name] = default_stats
+            debug_info.append(student_debug)
             continue
         
         scraper = AnkiWebScraper()
         
         try:
-            ok, _ = scraper.login(username, password)
+            student_debug["pasos"].append(f"🔑 Intentando login con: {username[:3]}***")
+            ok, msg = scraper.login(username, password)
+            
             if ok:
-                results[name] = scraper.get_stats_by_course(cursos)
+                student_debug["pasos"].append("✅ Login exitoso")
+                
+                # Obtener stats
+                stats = scraper.get_stats_by_course(cursos)
+                results[name] = stats
+                
+                # Registrar info de debug
+                if '_mazos_encontrados' in stats:
+                    for mazo in stats['_mazos_encontrados']:
+                        student_debug["pasos"].append(
+                            f"📚 Mazo: {mazo['mazo']} → {mazo['curso']} | Stats: {mazo['stats']}"
+                        )
+                
+                if '_notas_internas' in stats:
+                    for nota in stats['_notas_internas']:
+                        student_debug["pasos"].append(f"⚠️ {nota}")
+                
+                # Resumen
+                total = stats.get('_total', {})
+                student_debug["pasos"].append(
+                    f"📊 Total: Review={total.get('review', 0)}, Learning={total.get('learning', 0)}, New={total.get('new', 0)}"
+                )
             else:
+                student_debug["pasos"].append(f"❌ Login fallido: {msg}")
                 results[name] = default_stats
-        except:
+                
+        except Exception as e:
+            student_debug["pasos"].append(f"💥 Error: {str(e)}")
+            import traceback
+            student_debug["pasos"].append(f"📋 Traceback: {traceback.format_exc()[:500]}")
             results[name] = default_stats
         finally:
             scraper.logout()
-            time.sleep(1)
+            time.sleep(0.5)  # Reducido para más velocidad
         
+        debug_info.append(student_debug)
         progress.progress((i + 1) / len(students))
     
     status.empty()
     progress.empty()
+    
+    # Mostrar información de debug en un expander
+    with st.expander("🔍 Ver Detalles de Conexión AnkiWeb", expanded=True):
+        for student_info in debug_info:
+            st.markdown(f"**{student_info['nombre']}**")
+            for paso in student_info["pasos"]:
+                st.text(paso)
+            st.markdown("---")
+        
+        # Mostrar HTML preview si está disponible
+        if results:
+            first_student = list(results.keys())[0] if results else None
+            if first_student and '_html_preview' in results.get(first_student, {}):
+                html_preview = results[first_student].get('_html_preview', '')
+                if html_preview:
+                    st.markdown("**📄 Vista previa HTML recibido (primeros 1000 chars):**")
+                    st.code(html_preview[:1000], language="html")
     
     return results
 
