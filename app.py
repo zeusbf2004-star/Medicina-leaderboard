@@ -26,15 +26,21 @@ CURSOS = ["Fisiopatología", "Epidemiología", "Farmacología", "Patología"]
 
 # Nombres EXACTOS de los mazos oficiales en AnkiWeb (mapeo curso -> nombre exacto del mazo)
 # Cada estudiante DEBE tener el mazo con este nombre exacto para que se contabilice
+# IMPORTANTE: Usar el nombre de la fila PRINCIPAL del mazo (incluye suma de submazos)
 CURSO_DECKS_EXACTOS = {
-    "Fisiopatología": "Estudio universitario::V ciclo::Fisiopatología",
-    "Epidemiología": "Estudio universitario::V ciclo::Epidemiología",
-    "Farmacología": "Estudio universitario::V ciclo::Farmacología",
-    "Patología": "Estudio universitario::V ciclo::Patología",
+    "Fisiopatología": "Fisiopatología Uribe",  # Mazo principal que contiene submazos
+    "Epidemiología": "Epidemiología",
+    "Farmacología": "Farmacología", 
+    "Patología": "Patología",
 }
 
-# Multiplicadores para el cálculo de score
-ANKI_MULTIPLIER = 0.5
+# Multiplicadores para el cálculo de score (Fórmula Médica)
+# Score = (Review * 0.8) + (Learning * 0.5) + (New * 0.2)
+REVIEW_MULTIPLIER = 0.8    # Tarjetas de repaso (verdes) - Mayor peso
+LEARNING_MULTIPLIER = 0.5  # Tarjetas en aprendizaje (rojas) - Peso medio
+NEW_MULTIPLIER = 0.2       # Tarjetas nuevas (azules) - Menor peso
+
+# Multiplicador para Notion (quices)
 NOTION_MULTIPLIER = 10
 
 # Notion API Version
@@ -312,42 +318,60 @@ def fetch_notion_scores(cursos: List[str]) -> Dict[str, Dict[str, float]]:
 # ============================================================================
 
 class AnkiWebScraper:
-    """Cliente para extraer estadísticas de AnkiWeb por mazo."""
+    """
+    Cliente para extraer estadísticas de AnkiWeb por mazo.
+    
+    Implementa:
+    - Login con manejo de CSRF
+    - Extracción de mazos desde /decks/ con clase 'row light-bottom-border'
+    - Selección de mazo con POST para obtener desglose
+    - Extracción de contadores Review/Learning/New desde /study
+    """
     
     BASE_URL = "https://ankiweb.net"
     LOGIN_URL = f"{BASE_URL}/account/login"
     DECKS_URL = f"{BASE_URL}/decks/"
+    STUDY_URL = f"{BASE_URL}/study"
     
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
             'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
         })
         self.logged_in = False
+        self.csrf_token = ''
     
     def _get_csrf_token(self, html: str) -> str:
-        """Extrae el token CSRF."""
+        """Extrae el token CSRF de la página."""
         soup = BeautifulSoup(html, 'html.parser')
+        
+        # Buscar en input hidden
         csrf = soup.find('input', {'name': 'csrf_token'})
         if csrf and csrf.get('value'):
             return csrf.get('value', '')
+        
+        # Buscar en meta tag
         meta = soup.find('meta', {'name': 'csrf-token'})
         if meta and meta.get('content'):
             return meta.get('content', '')
+        
         return ''
     
     def login(self, username: str, password: str) -> Tuple[bool, str]:
         """Realiza el login en AnkiWeb."""
         try:
+            # Obtener página de login y CSRF token
             resp = self.session.get(self.LOGIN_URL, timeout=15)
             resp.raise_for_status()
             
-            csrf = self._get_csrf_token(resp.text)
+            self.csrf_token = self._get_csrf_token(resp.text)
             
             data = {
-                'csrf_token': csrf,
+                'csrf_token': self.csrf_token,
                 'submitted': '1',
                 'username': username,
                 'password': password,
@@ -357,6 +381,8 @@ class AnkiWebScraper:
             
             if 'logout' in resp.text.lower() or '/decks' in resp.url:
                 self.logged_in = True
+                # Actualizar CSRF para siguientes requests
+                self.csrf_token = self._get_csrf_token(resp.text)
                 return True, "OK"
             
             return False, "Credenciales inválidas"
@@ -366,8 +392,19 @@ class AnkiWebScraper:
         except requests.RequestException as e:
             return False, str(e)
     
-    def get_decks_data(self) -> List[Dict]:
-        """Obtiene datos de la tabla de mazos."""
+    def get_decks_list(self, debug: bool = False) -> List[Dict]:
+        """
+        Obtiene la lista de mazos desde /decks/.
+        
+        Busca filas con clase 'row light-bottom-border' según la estructura real de AnkiWeb.
+        Solo extrae mazos principales (sin indentación) para evitar duplicar submazos.
+        
+        Args:
+            debug: Si True, imprime información de debug
+            
+        Returns:
+            Lista de diccionarios con {name, deck_id} de cada mazo principal
+        """
         if not self.logged_in:
             return []
         
@@ -378,81 +415,329 @@ class AnkiWebScraper:
             resp.raise_for_status()
             
             soup = BeautifulSoup(resp.text, 'html.parser')
-            table = soup.find('table', {'id': 'decks'})
             
-            if table:
-                for row in table.find_all('tr'):
-                    cols = row.find_all('td')
-                    if len(cols) >= 2:
-                        link = cols[0].find('a')
-                        name = link.get_text(strip=True) if link else cols[0].get_text(strip=True)
-                        
-                        due = 0
-                        new = 0
-                        reviews = 0
-                        
-                        for i, col in enumerate(cols[1:], 1):
-                            nums = re.findall(r'\d+', col.get_text(strip=True))
-                            if nums:
-                                if i == 1:
-                                    due = int(nums[0])
-                                elif i == 2:
-                                    new = int(nums[0])
-                                elif i == 3:
-                                    reviews = int(nums[0])
-                        
-                        if name:
-                            decks.append({'name': name, 'due': due, 'new': new, 'reviews': reviews})
-        except:
-            pass
+            # Buscar filas con la clase específica de AnkiWeb
+            rows = soup.find_all('div', class_=re.compile(r'row.*light-bottom-border', re.I))
+            
+            if not rows:
+                # Fallback: buscar en tabla tradicional
+                rows = soup.find_all('tr', class_=re.compile(r'row', re.I))
+            
+            if not rows:
+                # Segundo fallback: buscar cualquier elemento con clase row
+                rows = soup.select('.row.light-bottom-border')
+            
+            if debug:
+                print(f"[DEBUG] Encontradas {len(rows)} filas de mazos")
+            
+            for row in rows:
+                # Buscar el enlace del mazo
+                link = row.find('a', href=True)
+                if not link:
+                    continue
+                
+                name = link.get_text(strip=True)
+                href = link.get('href', '')
+                
+                # Extraer deck_id del href (formato: /decks/DECK_ID/ o similar)
+                deck_id = None
+                if '/decks/' in href:
+                    parts = href.split('/decks/')
+                    if len(parts) > 1:
+                        deck_id = parts[1].strip('/')
+                
+                # Detectar si es un submazo (tiene indentación o padding)
+                # Los submazos suelen tener clase adicional o estar indentados
+                is_submaze = False
+                style = row.get('style', '')
+                classes = ' '.join(row.get('class', []))
+                
+                # Verificar indentación por padding-left o clase de submazo
+                if 'padding-left' in style or 'indent' in classes.lower() or 'sub' in classes.lower():
+                    is_submaze = True
+                
+                # También verificar si el nombre tiene "::" (indica submazo en la jerarquía)
+                # Solo tomamos la parte final si queremos el nombre corto
+                # PERO: queremos el mazo principal que contiene la suma
+                
+                if name and not is_submaze:
+                    deck_data = {
+                        'name': name,
+                        'deck_id': deck_id,
+                        'href': href
+                    }
+                    decks.append(deck_data)
+                    
+                    if debug:
+                        print(f"[DEBUG] Mazo encontrado: '{name}' (ID: {deck_id})")
+                elif debug and is_submaze:
+                    print(f"[DEBUG] Submazo ignorado: '{name}'")
+                    
+        except Exception as e:
+            if debug:
+                print(f"[DEBUG] Error al obtener lista de mazos: {e}")
         
         return decks
     
+    def select_deck_and_get_study_counts(self, deck_name: str, debug: bool = False) -> Dict[str, int]:
+        """
+        Selecciona un mazo y obtiene los contadores de la página de estudio.
+        
+        AnkiWeb muestra en /study:
+        - Review (verde): Tarjetas de repaso programadas
+        - Learning (rojo): Tarjetas en proceso de aprendizaje
+        - New (azul): Tarjetas nuevas sin ver
+        
+        Args:
+            deck_name: Nombre del mazo a seleccionar
+            debug: Si True, imprime información de debug
+            
+        Returns:
+            Dict con {'review': int, 'learning': int, 'new': int}
+        """
+        result = {'review': 0, 'learning': 0, 'new': 0}
+        
+        if not self.logged_in:
+            return result
+        
+        try:
+            # Primero, obtener la lista de mazos para encontrar el deck_id
+            decks = self.get_decks_list(debug=False)
+            
+            target_deck = None
+            for deck in decks:
+                if deck['name'].strip().lower() == deck_name.strip().lower():
+                    target_deck = deck
+                    break
+            
+            if not target_deck:
+                if debug:
+                    print(f"[DEBUG] Mazo '{deck_name}' no encontrado en la lista")
+                return result
+            
+            if debug:
+                print(f"[DEBUG] Seleccionando mazo: '{deck_name}'")
+            
+            # Navegar a la página del mazo o hacer POST para seleccionarlo
+            # AnkiWeb usa /study con el deck seleccionado
+            if target_deck.get('href'):
+                # Ir directamente al mazo
+                deck_url = f"{self.BASE_URL}{target_deck['href']}"
+                resp = self.session.get(deck_url, timeout=15)
+                resp.raise_for_status()
+                
+                # Ahora ir a /study
+                resp = self.session.get(self.STUDY_URL, timeout=15)
+                resp.raise_for_status()
+            else:
+                # Ir directamente a study
+                resp = self.session.get(self.STUDY_URL, timeout=15)
+                resp.raise_for_status()
+            
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            
+            # Buscar los contadores en la página de estudio
+            # AnkiWeb muestra los números en spans o divs con clases específicas
+            
+            # Método 1: Buscar por texto/clase que contenga los números
+            # Los contadores suelen estar en formato "Review: X" o similar
+            
+            # Buscar spans con números
+            count_elements = soup.find_all(['span', 'div'], class_=re.compile(r'count|num|badge', re.I))
+            
+            # Método 2: Buscar el texto directamente en la página
+            page_text = soup.get_text()
+            
+            # Patrones comunes en AnkiWeb
+            # Buscar "X review" o "review: X"
+            review_match = re.search(r'(\d+)\s*(?:review|repas)', page_text, re.I)
+            if review_match:
+                result['review'] = int(review_match.group(1))
+            
+            learning_match = re.search(r'(\d+)\s*(?:learning|apren|lrn)', page_text, re.I)
+            if learning_match:
+                result['learning'] = int(learning_match.group(1))
+            
+            new_match = re.search(r'(\d+)\s*(?:new|nuev)', page_text, re.I)
+            if new_match:
+                result['new'] = int(new_match.group(1))
+            
+            # Método 3: Buscar en la estructura específica de AnkiWeb
+            # Los contadores suelen estar en un grupo de 3 números
+            all_numbers = re.findall(r'\b(\d+)\b', page_text)
+            
+            # Si no encontramos con los patrones anteriores, 
+            # intentar extraer de la página del mazo directamente
+            if result['review'] == 0 and result['learning'] == 0 and result['new'] == 0:
+                # Buscar en divs con clase que contenga 'count' o 'stat'
+                stat_divs = soup.find_all(['div', 'span', 'td'], 
+                    class_=re.compile(r'due|new|learn|review|count|stat', re.I))
+                
+                for div in stat_divs:
+                    text = div.get_text(strip=True)
+                    classes = ' '.join(div.get('class', [])).lower()
+                    
+                    nums = re.findall(r'\d+', text)
+                    if nums:
+                        num = int(nums[0])
+                        if 'review' in classes or 'due' in classes:
+                            result['review'] = num
+                        elif 'learn' in classes or 'lrn' in classes:
+                            result['learning'] = num
+                        elif 'new' in classes:
+                            result['new'] = num
+            
+            if debug:
+                print(f"[DEBUG] Contadores para '{deck_name}': Review={result['review']}, Learning={result['learning']}, New={result['new']}")
+                
+        except Exception as e:
+            if debug:
+                print(f"[DEBUG] Error al obtener contadores de estudio: {e}")
+        
+        return result
+    
+    def get_deck_stats_from_decks_page(self, deck_name: str, debug: bool = False) -> Dict[str, int]:
+        """
+        Obtiene estadísticas de un mazo directamente desde la página /decks/.
+        
+        Esta es una alternativa más simple que extrae Due y New de la tabla principal.
+        
+        Args:
+            deck_name: Nombre exacto del mazo
+            debug: Si True, imprime información de debug
+            
+        Returns:
+            Dict con {'review': int, 'learning': int, 'new': int}
+        """
+        result = {'review': 0, 'learning': 0, 'new': 0}
+        
+        if not self.logged_in:
+            return result
+        
+        try:
+            resp = self.session.get(self.DECKS_URL, timeout=15)
+            resp.raise_for_status()
+            
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            
+            # Buscar todas las filas de mazos
+            # Intentar múltiples selectores
+            rows = soup.find_all('div', class_=re.compile(r'row.*light-bottom-border', re.I))
+            
+            if not rows:
+                # Fallback a tabla
+                table = soup.find('table')
+                if table:
+                    rows = table.find_all('tr')
+            
+            if not rows:
+                # Intentar con selectores más genéricos
+                rows = soup.select('[class*="deck"]')
+            
+            for row in rows:
+                # Buscar el nombre del mazo
+                link = row.find('a')
+                if not link:
+                    # Intentar buscar texto directo
+                    name_elem = row.find(class_=re.compile(r'name|title|deck', re.I))
+                    if name_elem:
+                        row_name = name_elem.get_text(strip=True)
+                    else:
+                        continue
+                else:
+                    row_name = link.get_text(strip=True)
+                
+                # Comparar nombres (case-insensitive)
+                if row_name.strip().lower() != deck_name.strip().lower():
+                    continue
+                
+                if debug:
+                    print(f"[DEBUG] Encontrado mazo '{row_name}' en la tabla")
+                
+                # Buscar los números en esta fila
+                # Pueden estar en spans, divs, o tds
+                numbers = []
+                
+                # Buscar elementos con números
+                num_elements = row.find_all(['span', 'div', 'td'], 
+                    class_=re.compile(r'count|num|due|new|learn|badge', re.I))
+                
+                for elem in num_elements:
+                    text = elem.get_text(strip=True)
+                    nums = re.findall(r'\d+', text)
+                    if nums:
+                        numbers.append(int(nums[0]))
+                
+                # Si no encontramos con clases, buscar todos los números en la fila
+                if not numbers:
+                    row_text = row.get_text()
+                    numbers = [int(n) for n in re.findall(r'\b(\d+)\b', row_text)]
+                
+                # Asignar números según posición típica: [Due/Review, New] o [Review, Learning, New]
+                if len(numbers) >= 3:
+                    result['review'] = numbers[0]
+                    result['learning'] = numbers[1]
+                    result['new'] = numbers[2]
+                elif len(numbers) >= 2:
+                    result['review'] = numbers[0]  # Due = Review
+                    result['new'] = numbers[1]
+                elif len(numbers) >= 1:
+                    result['review'] = numbers[0]
+                
+                if debug:
+                    print(f"[DEBUG] Estadísticas extraídas: {result}")
+                
+                break  # Encontramos el mazo, salir del loop
+                
+        except Exception as e:
+            if debug:
+                print(f"[DEBUG] Error al obtener stats desde /decks/: {e}")
+        
+        return result
+    
     def get_stats_by_course(self, cursos: List[str]) -> Dict[str, Dict[str, int]]:
         """
-        Agrupa estadísticas por curso basándose en coincidencia EXACTA de nombres de mazos.
+        Obtiene estadísticas por curso usando los nombres de mazos definidos.
         
-        Solo se suman tarjetas de mazos que coincidan exactamente con los nombres
-        definidos en CURSO_DECKS_EXACTOS. Si un mazo oficial no existe para un
-        estudiante, se asigna 0 puntos sin generar error.
+        Para cada curso, busca el mazo correspondiente y extrae:
+        - review: Tarjetas de repaso (verdes)
+        - learning: Tarjetas en aprendizaje (rojas)
+        - new: Tarjetas nuevas (azules)
         
         Args:
             cursos: Lista de cursos a buscar
             
         Returns:
-            Dict con estadísticas por curso y notas internas sobre mazos faltantes
+            Dict con estadísticas por curso
         """
-        stats = {c: {'due': 0, 'reviews': 0, 'new': 0} for c in cursos}
-        stats['_total'] = {'due': 0, 'reviews': 0, 'new': 0}
-        stats['_notas_internas'] = []  # Registro de mazos no encontrados
+        stats = {c: {'review': 0, 'learning': 0, 'new': 0} for c in cursos}
+        stats['_total'] = {'review': 0, 'learning': 0, 'new': 0}
+        stats['_notas_internas'] = []
         
-        decks = self.get_decks_data()
-        
-        # Crear un set de nombres de mazos encontrados (normalizados) para validación
-        mazos_encontrados = {deck['name'].strip().lower() for deck in decks}
-        
-        # Verificar qué mazos oficiales faltan y registrar nota interna
         for curso in cursos:
-            nombre_mazo_oficial = CURSO_DECKS_EXACTOS.get(curso, "")
-            if nombre_mazo_oficial and nombre_mazo_oficial.lower() not in mazos_encontrados:
-                stats['_notas_internas'].append(
-                    f"Mazo '{nombre_mazo_oficial}' para {curso} no encontrado"
-                )
-        
-        # Procesar cada mazo encontrado
-        for deck in decks:
-            # Siempre sumar al total general
-            stats['_total']['due'] += deck['due']
-            stats['_total']['reviews'] += deck['reviews']
-            stats['_total']['new'] += deck['new']
+            nombre_mazo = CURSO_DECKS_EXACTOS.get(curso, "")
             
-            # Solo sumar a un curso si hay coincidencia EXACTA con el mazo oficial
-            for curso in cursos:
-                if match_course_in_deck(deck['name'], curso):
-                    stats[curso]['due'] += deck['due']
-                    stats[curso]['reviews'] += deck['reviews']
-                    stats[curso]['new'] += deck['new']
-                    break  # Un mazo solo puede pertenecer a un curso
+            if not nombre_mazo:
+                stats['_notas_internas'].append(f"No hay mazo configurado para {curso}")
+                continue
+            
+            # Intentar obtener stats desde la página de mazos primero (más rápido)
+            deck_stats = self.get_deck_stats_from_decks_page(nombre_mazo, debug=True)
+            
+            # Si no obtuvimos datos, intentar con selección de mazo
+            if deck_stats['review'] == 0 and deck_stats['learning'] == 0 and deck_stats['new'] == 0:
+                deck_stats = self.select_deck_and_get_study_counts(nombre_mazo, debug=True)
+            
+            if deck_stats['review'] == 0 and deck_stats['learning'] == 0 and deck_stats['new'] == 0:
+                stats['_notas_internas'].append(f"Mazo '{nombre_mazo}' para {curso} sin datos")
+            
+            # Guardar stats del curso
+            stats[curso] = deck_stats
+            
+            # Sumar al total
+            stats['_total']['review'] += deck_stats['review']
+            stats['_total']['learning'] += deck_stats['learning']
+            stats['_total']['new'] += deck_stats['new']
         
         return stats
     
@@ -465,6 +750,7 @@ class AnkiWebScraper:
                 pass
         self.session = requests.Session()
         self.logged_in = False
+
 
 
 def get_students_from_secrets() -> List[Dict]:
@@ -493,7 +779,12 @@ def get_students_from_secrets() -> List[Dict]:
 
 
 def fetch_anki_stats(students: List[Dict], cursos: List[str]) -> Dict:
-    """Obtiene estadísticas de Anki para todos los estudiantes."""
+    """
+    Obtiene estadísticas de Anki para todos los estudiantes.
+    
+    Estructura de retorno por estudiante:
+    {curso: {'review': int, 'learning': int, 'new': int}}
+    """
     results = {}
     
     if not students:
@@ -509,9 +800,12 @@ def fetch_anki_stats(students: List[Dict], cursos: List[str]) -> Dict:
         
         status.text(f"📚 Conectando Anki: {name}...")
         
+        # Estructura por defecto con review, learning, new
+        default_stats = {c: {'review': 0, 'learning': 0, 'new': 0} for c in cursos}
+        default_stats['_total'] = {'review': 0, 'learning': 0, 'new': 0}
+        
         if not username or not password:
-            results[name] = {c: {'due': 0, 'reviews': 0, 'new': 0} for c in cursos}
-            results[name]['_total'] = {'due': 0, 'reviews': 0, 'new': 0}
+            results[name] = default_stats
             continue
         
         scraper = AnkiWebScraper()
@@ -521,11 +815,9 @@ def fetch_anki_stats(students: List[Dict], cursos: List[str]) -> Dict:
             if ok:
                 results[name] = scraper.get_stats_by_course(cursos)
             else:
-                results[name] = {c: {'due': 0, 'reviews': 0, 'new': 0} for c in cursos}
-                results[name]['_total'] = {'due': 0, 'reviews': 0, 'new': 0}
+                results[name] = default_stats
         except:
-            results[name] = {c: {'due': 0, 'reviews': 0, 'new': 0} for c in cursos}
-            results[name]['_total'] = {'due': 0, 'reviews': 0, 'new': 0}
+            results[name] = default_stats
         finally:
             scraper.logout()
             time.sleep(1)
@@ -543,7 +835,13 @@ def fetch_anki_stats(students: List[Dict], cursos: List[str]) -> Dict:
 # ============================================================================
 
 def calculate_scores(anki: Dict, notion: Dict, cursos: List[str]) -> Dict[str, pd.DataFrame]:
-    """Calcula scores por curso y general."""
+    """
+    Calcula scores por curso y general usando la Fórmula Médica.
+    
+    Fórmula:
+    Score Anki = (Review * 0.8) + (Learning * 0.5) + (New * 0.2)
+    Score Total = Score Anki + (Quices * 10)
+    """
     all_students = set(anki.keys()) | set(notion.keys())
     results = {}
     
@@ -551,17 +849,27 @@ def calculate_scores(anki: Dict, notion: Dict, cursos: List[str]) -> Dict[str, p
     for curso in cursos:
         data = []
         for student in all_students:
-            a = anki.get(student, {}).get(curso, {'due': 0, 'reviews': 0})
-            anki_cards = a.get('reviews', 0) + a.get('due', 0)
-            n = notion.get(student, {}).get(curso, 0)
+            a = anki.get(student, {}).get(curso, {'review': 0, 'learning': 0, 'new': 0})
             
-            anki_pts = anki_cards * ANKI_MULTIPLIER
+            # Extraer contadores
+            review = a.get('review', 0)
+            learning = a.get('learning', 0)
+            new = a.get('new', 0)
+            
+            # Fórmula Médica para Anki
+            anki_pts = (review * REVIEW_MULTIPLIER) + (learning * LEARNING_MULTIPLIER) + (new * NEW_MULTIPLIER)
+            
+            # Puntaje de Notion (quices)
+            n = notion.get(student, {}).get(curso, 0)
             notion_pts = n * NOTION_MULTIPLIER
+            
             total = anki_pts + notion_pts
             
             data.append({
                 'Estudiante': student,
-                'Tarjetas': anki_cards,
+                'Review': review,
+                'Learning': learning,
+                'New': new,
                 'Pts Anki': round(anki_pts, 1),
                 'Quices': n,
                 'Pts Notion': round(notion_pts, 1),
@@ -577,17 +885,27 @@ def calculate_scores(anki: Dict, notion: Dict, cursos: List[str]) -> Dict[str, p
     # General
     data = []
     for student in all_students:
-        a_total = anki.get(student, {}).get('_total', {'due': 0, 'reviews': 0})
-        anki_cards = a_total.get('reviews', 0) + a_total.get('due', 0)
-        n_total = notion.get(student, {}).get('_total', 0)
+        a_total = anki.get(student, {}).get('_total', {'review': 0, 'learning': 0, 'new': 0})
         
-        anki_pts = anki_cards * ANKI_MULTIPLIER
+        # Extraer contadores totales
+        review = a_total.get('review', 0)
+        learning = a_total.get('learning', 0)
+        new = a_total.get('new', 0)
+        
+        # Fórmula Médica para Anki
+        anki_pts = (review * REVIEW_MULTIPLIER) + (learning * LEARNING_MULTIPLIER) + (new * NEW_MULTIPLIER)
+        
+        # Puntaje de Notion (quices)
+        n_total = notion.get(student, {}).get('_total', 0)
         notion_pts = n_total * NOTION_MULTIPLIER
+        
         total = anki_pts + notion_pts
         
         data.append({
             'Estudiante': student,
-            'Tarjetas': anki_cards,
+            'Review': review,
+            'Learning': learning,
+            'New': new,
             'Pts Anki': round(anki_pts, 1),
             'Quices': n_total,
             'Pts Notion': round(notion_pts, 1),
@@ -608,7 +926,9 @@ def calculate_scores(anki: Dict, notion: Dict, cursos: List[str]) -> Dict[str, p
 # ============================================================================
 
 def load_demo_data(cursos: List[str]) -> Tuple[Dict, Dict]:
-    """Genera datos demo."""
+    """
+    Genera datos demo con la estructura review, learning, new.
+    """
     import random
     random.seed(42)
     
@@ -617,11 +937,22 @@ def load_demo_data(cursos: List[str]) -> Tuple[Dict, Dict]:
     notion = {}
     
     for name in names:
-        anki[name] = {'_total': {'due': random.randint(20, 80), 'reviews': random.randint(50, 200), 'new': 0}}
+        # Estructura con review, learning, new
+        anki[name] = {
+            '_total': {
+                'review': random.randint(20, 80), 
+                'learning': random.randint(5, 20),
+                'new': random.randint(10, 50)
+            }
+        }
         notion[name] = {'_total': random.randint(60, 100)}
         
         for c in cursos:
-            anki[name][c] = {'due': random.randint(5, 30), 'reviews': random.randint(20, 80), 'new': 0}
+            anki[name][c] = {
+                'review': random.randint(5, 30), 
+                'learning': random.randint(2, 10),
+                'new': random.randint(5, 20)
+            }
             notion[name][c] = random.randint(0, 20)
     
     return anki, notion
@@ -710,15 +1041,15 @@ def render_table(df: pd.DataFrame):
 
 
 def render_sidebar():
-    """Barra lateral."""
+    """Barra lateral con configuración y fórmula."""
     with st.sidebar:
         st.markdown("## ⚙️ Config")
         st.markdown("### 📚 Cursos")
         for c in CURSOS:
             st.markdown(f"• {c}")
         st.markdown("---")
-        st.markdown("### 📐 Fórmula")
-        st.code(f"Score = Anki×{ANKI_MULTIPLIER} + Quiz×{NOTION_MULTIPLIER}")
+        st.markdown("### 📐 Fórmula Médica")
+        st.code(f"Review×{REVIEW_MULTIPLIER} + Learning×{LEARNING_MULTIPLIER} + New×{NEW_MULTIPLIER} + Quiz×{NOTION_MULTIPLIER}")
         st.markdown("---")
         if 'last_update' in st.session_state:
             st.caption(f"🕐 {st.session_state.last_update}")
@@ -789,7 +1120,7 @@ def main():
     
     # Footer
     st.markdown("---")
-    st.caption(f"📐 Score = (Tarjetas × {ANKI_MULTIPLIER}) + (Quices × {NOTION_MULTIPLIER}) | v3.0 - API Directa")
+    st.caption(f"📐 Fórmula Médica: (Review×{REVIEW_MULTIPLIER}) + (Learning×{LEARNING_MULTIPLIER}) + (New×{NEW_MULTIPLIER}) + (Quiz×{NOTION_MULTIPLIER}) | v4.0 - Extracción Avanzada")
 
 
 if __name__ == "__main__":
