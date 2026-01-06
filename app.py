@@ -345,7 +345,7 @@ class AnkiWebScraper:
     BASE_URL = "https://ankiweb.net"
     LOGIN_URL = f"{BASE_URL}/account/login"
     DECKS_URL = f"{BASE_URL}/decks/"
-    STUDY_URL = f"{BASE_URL}/study"
+    STUDY_URL = f"https://ankiuser.net/study"
     
     def __init__(self):
         self.session = requests.Session()
