@@ -873,16 +873,15 @@ class AnkiWebScraper:
                 if wire_type == 0:  # Varint
                     value, pos = read_varint(data, pos)
                     # Mapeo de campos a contadores (basado en análisis hex)
-                    # Los campos ya contienen la suma de submazos
-                    # Campo 7 (0x38): learning count
-                    # Campo 8 (0x40): new count
-                    # Campo 9 (0x48): due/review count
-                    if field_num == 7:  # learn_count
-                        result['learning'] = value  # Usar = no += (evitar duplicación)
+                    # Campo 6 (0x30): review count (tarjetas a repasar - verdes)
+                    # Campo 7 (0x38): learning count (tarjetas aprendiendo - rojas)
+                    # Campo 8 (0x40): new count (tarjetas nuevas - azules)
+                    if field_num == 6:  # review_count
+                        result['due'] = value
+                    elif field_num == 7:  # learn_count
+                        result['learning'] = value
                     elif field_num == 8:  # new_count
                         result['new'] = value
-                    elif field_num == 9:  # due/review count
-                        result['due'] = value
                         
                 elif wire_type == 2:  # Length-delimited (string o submensaje)
                     length, pos = read_varint(data, pos)
