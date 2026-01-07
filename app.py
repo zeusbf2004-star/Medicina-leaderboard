@@ -25,13 +25,24 @@ from typing import Dict, List, Optional, Tuple
 CURSOS = ["Fisiopatología", "Epidemiología", "Farmacología", "Patología"]
 
 # Palabras clave para identificar mazos en AnkiWeb (mapeo curso -> palabras clave)
-# El sistema buscará mazos que CONTENGAN alguna de estas palabras clave
-# Esto funciona con cualquier estructura de jerarquía (::)
+# 
+# IMPORTANTE: Usa nombres EXACTOS de mazos para evitar falsos positivos
+# - Prefijo "=" indica coincidencia EXACTA (ej: "=Fisiopatología Uribe")
+# - Sin prefijo indica que el mazo debe CONTENER la palabra clave
+#
+# Esto permite encontrar mazos independientemente de su jerarquía (::)
 CURSO_DECK_KEYWORDS = {
-    "Fisiopatología": ["fisiopatología uribe", "fisiopatologia uribe", "fisiopato uribe"],
-    "Epidemiología": ["epidemiología", "epidemiologia", "epidemio"],
-    "Farmacología": ["farmacología", "farmacologia", "farmaco"], 
-    "Patología": ["patología", "patologia", "pato"],
+    # Para Fisiopatología: SOLO el mazo específico "Fisiopatología Uribe"
+    "Fisiopatología": ["=Fisiopatología Uribe", "=fisiopatologia uribe"],
+    
+    # Para Epidemiología: SOLO mazos que se llamen exactamente "Epidemiología"
+    "Epidemiología": ["=Epidemiología", "=epidemiologia"],
+    
+    # Para Farmacología: SOLO mazos que se llamen exactamente "Farmacología" o "Farmacología médica"
+    "Farmacología": ["=Farmacología", "=Farmacología médica", "=farmacologia", "=farmacologia medica"],
+    
+    # Para Patología: SOLO mazos que se llamen exactamente "Patología" o "Patología general"
+    "Patología": ["=Patología", "=Patología general", "=Patología clínica", "=patologia"],
 }
 
 # Multiplicadores para el cálculo de score (Fórmula Médica)
@@ -66,36 +77,42 @@ def normalize_text(text: str) -> str:
 
 def match_course_in_deck(deck_name: str, curso: str) -> bool:
     """
-    Verifica si el nombre de un mazo corresponde a un curso usando búsqueda flexible.
+    Verifica si el nombre de un mazo corresponde a un curso.
     
-    Busca si el nombre del mazo CONTIENE alguna de las palabras clave del curso.
-    Esto permite encontrar mazos independientemente de su jerarquía (::).
+    Modos de coincidencia:
+    - "=Nombre Exacto": El mazo debe coincidir EXACTAMENTE con el nombre
+    - "palabra clave": El mazo debe CONTENER la palabra clave
     
-    Ejemplos que funcionarían para Fisiopatología:
-    - "Fisiopatología Uribe"
-    - "Estudio universitario::V ciclo::Fisiopatología::Fisiopatología Uribe"
-    - "fisiopatologia uribe"
+    Ejemplos:
+    - "=Fisiopatología Uribe" coincide SOLO con "Fisiopatología Uribe"
+    - "patología" coincidiría con "Patología", "Fisiopatología", etc. (NO recomendado)
     
     Args:
         deck_name: Nombre del mazo encontrado en AnkiWeb
         curso: Nombre del curso a verificar
     
     Returns:
-        True si el mazo contiene alguna palabra clave del curso
+        True si el mazo coincide con alguna palabra clave del curso
     """
     keywords = CURSO_DECK_KEYWORDS.get(curso, [])
     
     if not keywords:
         return False
     
-    # Normalizar el nombre del mazo para comparación
+    # Normalizar el nombre del mazo
     deck_normalized = normalize_text(deck_name)
     
-    # Buscar si alguna palabra clave está contenida en el nombre del mazo
     for keyword in keywords:
-        keyword_normalized = normalize_text(keyword)
-        if keyword_normalized in deck_normalized:
-            return True
+        # Verificar si es coincidencia exacta (prefijo "=")
+        if keyword.startswith("="):
+            exact_name = normalize_text(keyword[1:])  # Quitar el "="
+            if deck_normalized == exact_name:
+                return True
+        else:
+            # Coincidencia por contenido (comportamiento anterior)
+            keyword_normalized = normalize_text(keyword)
+            if keyword_normalized in deck_normalized:
+                return True
     
     return False
 
