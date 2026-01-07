@@ -743,15 +743,164 @@ class AnkiWebScraper:
         
         return result
     
+    def get_decks_via_api(self) -> Tuple[List[Dict], List[str]]:
+        """
+        Obtiene mazos desde el API de AnkiWeb.
+        
+        Endpoint: POST /svc/decks/deck-list-info
+        Formato: Protobuf binario
+        
+        Returns:
+            Tuple (lista de mazos, mensajes de debug)
+        """
+        debug_msgs = []
+        
+        if not self.logged_in:
+            return [], ["No se ha iniciado sesión"]
+        
+        try:
+            url = f"{self.BASE_URL}/svc/decks/deck-list-info"
+            headers = {
+                'Content-Type': 'application/octet-stream',
+                'Accept': '*/*',
+            }
+            
+            # Request POST con body vacío
+            resp = self.session.post(url, data=b'', headers=headers, timeout=15)
+            debug_msgs.append(f"📡 API Response: {resp.status_code}, {len(resp.content)} bytes")
+            
+            if resp.status_code == 200 and resp.content:
+                decks = self._parse_protobuf_decks(resp.content, debug_msgs)
+                debug_msgs.append(f"📊 Mazos parseados: {len(decks)}")
+                return decks, debug_msgs
+            else:
+                debug_msgs.append(f"❌ Error API: HTTP {resp.status_code}")
+                
+        except Exception as e:
+            debug_msgs.append(f"💥 Error API: {str(e)}")
+        
+        return [], debug_msgs
+    
+    def _parse_protobuf_decks(self, data: bytes, debug_msgs: List[str]) -> List[Dict]:
+        """
+        Parsea la respuesta Protobuf de deck-list-info.
+        
+        Estructura Protobuf básica:
+        - Tag 0x0A (10): Campo string (nombres)
+        - Tag 0x08 (8): Campo varint (números)
+        - Tag 0x10 (16): Campo varint (números)
+        - Tag 0x18 (24): Campo varint (números)
+        
+        Args:
+            data: Bytes de respuesta Protobuf
+            debug_msgs: Lista para agregar mensajes de debug
+            
+        Returns:
+            Lista de diccionarios {name, due, new, learning}
+        """
+        decks = []
+        
+        try:
+            debug_msgs.append(f"🔍 Parseando {len(data)} bytes de Protobuf")
+            
+            # Estrategia: buscar strings que parezcan nombres de mazos
+            # y números cercanos que sean los contadores
+            
+            i = 0
+            current_deck = None
+            
+            while i < len(data):
+                tag = data[i]
+                
+                # Tag 0x0A = string (posible nombre de mazo)
+                if tag == 0x0A and i + 1 < len(data):
+                    length = data[i + 1]
+                    if i + 2 + length <= len(data):
+                        try:
+                            text = data[i + 2:i + 2 + length].decode('utf-8', errors='ignore')
+                            # Filtrar strings que parecen nombres de mazos (no URLs, no código)
+                            if (len(text) > 1 and 
+                                not text.startswith('/') and 
+                                not text.startswith('http') and
+                                not text.startswith('_') and
+                                not '.' in text[:5] and  # Evitar extensiones
+                                any(c.isalpha() for c in text)):
+                                
+                                # Guardar deck anterior si existe
+                                if current_deck and current_deck.get('name'):
+                                    decks.append(current_deck)
+                                
+                                current_deck = {
+                                    'name': text,
+                                    'due': 0,
+                                    'new': 0,
+                                    'learning': 0
+                                }
+                        except:
+                            pass
+                        i += 2 + length
+                        continue
+                
+                # Tag 0x08, 0x10, 0x18 = varints (posibles contadores)
+                if tag in (0x08, 0x10, 0x18, 0x20, 0x28) and i + 1 < len(data):
+                    # Leer varint
+                    value = 0
+                    shift = 0
+                    j = i + 1
+                    while j < len(data):
+                        byte = data[j]
+                        value |= (byte & 0x7F) << shift
+                        j += 1
+                        if not (byte & 0x80):
+                            break
+                        shift += 7
+                    
+                    # Asignar al deck actual si existe
+                    if current_deck:
+                        if tag == 0x10 and current_deck['due'] == 0:
+                            current_deck['due'] = value
+                        elif tag == 0x18 and current_deck['new'] == 0:
+                            current_deck['new'] = value
+                        elif tag == 0x20:
+                            current_deck['learning'] = value
+                    
+                    i = j
+                    continue
+                
+                i += 1
+            
+            # Agregar último deck
+            if current_deck and current_deck.get('name'):
+                decks.append(current_deck)
+            
+            # Filtrar mazos válidos (con nombre y algún contador o que parezcan mazos reales)
+            valid_decks = []
+            for deck in decks:
+                name = deck.get('name', '')
+                # Filtrar nombres que no parecen mazos
+                if (len(name) >= 2 and 
+                    not name.startswith('svelte') and
+                    not 'chunk' in name.lower() and
+                    not 'module' in name.lower()):
+                    valid_decks.append(deck)
+            
+            debug_msgs.append(f"✅ Mazos válidos encontrados: {len(valid_decks)}")
+            for deck in valid_decks[:5]:  # Mostrar primeros 5 para debug
+                debug_msgs.append(f"  📚 {deck['name']}: due={deck['due']}, new={deck['new']}")
+            
+            return valid_decks
+            
+        except Exception as e:
+            debug_msgs.append(f"💥 Error parseando Protobuf: {str(e)}")
+            return []
+    
     def get_stats_by_course(self, cursos: List[str]) -> Dict[str, Dict[str, int]]:
         """
-        Obtiene estadísticas por curso desde la página /decks/ de AnkiWeb.
+        Obtiene estadísticas por curso usando el API de AnkiWeb.
         
-        Estructura real de AnkiWeb (según investigación):
-        - Cada mazo está en un div.row.light-bottom-border
-        - El nombre está en un button.btn.btn-link (NO en un <a>)
-        - Contadores: div.number.due (verde) y div.number.new (azul)
-        - NOTA: 'due' combina Review + Learning en un solo número
+        Estrategia:
+        1. Primero intenta obtener mazos via API (endpoint Protobuf)
+        2. Si falla, intenta scraping de página como fallback
         
         Args:
             cursos: Lista de cursos a buscar
@@ -763,152 +912,64 @@ class AnkiWebScraper:
         stats['_total'] = {'review': 0, 'learning': 0, 'new': 0}
         stats['_notas_internas'] = []
         stats['_mazos_encontrados'] = []
-        stats['_html_preview'] = ""  # Para debug
         
         if not self.logged_in:
             stats['_notas_internas'].append("No se ha iniciado sesión")
             return stats
         
-        try:
-            resp = self.session.get(self.DECKS_URL, timeout=15)
-            resp.raise_for_status()
+        # === MÉTODO 1: API Protobuf (preferido) ===
+        stats['_notas_internas'].append("� Intentando API Protobuf...")
+        decks, api_debug = self.get_decks_via_api()
+        
+        # Agregar mensajes de debug del API
+        for msg in api_debug:
+            stats['_notas_internas'].append(msg)
+        
+        if decks:
+            stats['_notas_internas'].append(f"✅ API exitosa: {len(decks)} mazos obtenidos")
             
-            soup = BeautifulSoup(resp.text, 'html.parser')
-            
-            # Guardar preview del HTML para debug
-            stats['_html_preview'] = resp.text[:1000]
-            stats['_notas_internas'].append(f"📡 Respuesta HTTP: {resp.status_code}")
-            stats['_notas_internas'].append(f"📄 Tamaño HTML: {len(resp.text)} chars")
-            
-            # Método 1: Buscar divs con clase 'row' que contengan mazos
-            deck_rows = soup.find_all('div', class_=re.compile(r'row.*light-bottom-border', re.I))
-            stats['_notas_internas'].append(f"🔍 Método 1 (div.row.light-bottom-border): {len(deck_rows)} elementos")
-            
-            if not deck_rows:
-                # Método 2: Buscar cualquier div con clase 'row'
-                deck_rows = soup.find_all('div', class_=re.compile(r'^row$|row\s', re.I))
-                stats['_notas_internas'].append(f"🔍 Método 2 (div.row): {len(deck_rows)} elementos")
-            
-            if not deck_rows:
-                # Método 3: Buscar en tabla tradicional
-                table = soup.find('table')
-                if table:
-                    deck_rows = table.find_all('tr')
-                    stats['_notas_internas'].append(f"🔍 Método 3 (table tr): {len(deck_rows)} elementos")
-                else:
-                    stats['_notas_internas'].append("🔍 Método 3: No se encontró tabla")
-            
-            if not deck_rows:
-                # Método 4: Buscar botones de mazos directamente
-                deck_buttons = soup.find_all('button', class_=re.compile(r'btn.*link', re.I))
-                stats['_notas_internas'].append(f"🔍 Método 4 (buttons): {len(deck_buttons)} botones")
+            # Procesar mazos obtenidos del API
+            for deck in decks:
+                deck_name = deck.get('name', '')
+                due = deck.get('due', 0)
+                new = deck.get('new', 0)
+                learning = deck.get('learning', 0)
                 
-                for btn in deck_buttons:
-                    deck_name = btn.get_text(strip=True)
-                    if deck_name:
-                        # Buscar contadores cercanos
-                        parent = btn.find_parent()
-                        if parent:
-                            deck_rows.append(parent)
-            
-            stats['_notas_internas'].append(f"📊 Total filas/elementos encontrados: {len(deck_rows)}")
-            
-            for row in deck_rows:
-                # Extraer nombre del mazo
-                # Buscar en botón primero, luego en enlace
-                btn = row.find('button')
-                if btn:
-                    deck_name = btn.get_text(strip=True)
-                else:
-                    link = row.find('a')
-                    if link:
-                        deck_name = link.get_text(strip=True)
-                    else:
-                        deck_name = row.get_text(strip=True)[:50]  # Primeros 50 chars
-                
-                if not deck_name or len(deck_name) < 2:
-                    continue
-                
-                # Limpiar nombre (quitar espacios de indentación)
-                deck_name = deck_name.strip()
-                
-                print(f"[DEBUG] Mazo encontrado: '{deck_name}'")
-                
-                # Extraer contadores con clases específicas
-                due_elem = row.find(class_=re.compile(r'due|review', re.I))
-                new_elem = row.find(class_=re.compile(r'new', re.I))
-                learn_elem = row.find(class_=re.compile(r'learn', re.I))
-                
-                due = 0
-                new = 0
-                learning = 0
-                
-                if due_elem:
-                    due_text = due_elem.get_text(strip=True)
-                    due_nums = re.findall(r'\d+', due_text)
-                    if due_nums:
-                        due = int(due_nums[0])
-                
-                if new_elem:
-                    new_text = new_elem.get_text(strip=True)
-                    new_nums = re.findall(r'\d+', new_text)
-                    if new_nums:
-                        new = int(new_nums[0])
-                
-                if learn_elem:
-                    learn_text = learn_elem.get_text(strip=True)
-                    learn_nums = re.findall(r'\d+', learn_text)
-                    if learn_nums:
-                        learning = int(learn_nums[0])
-                
-                # Si no encontramos con clases específicas, buscar todos los números
-                if due == 0 and new == 0:
-                    all_nums = re.findall(r'\b(\d+)\b', row.get_text())
-                    if len(all_nums) >= 2:
-                        due = int(all_nums[0])
-                        new = int(all_nums[1])
-                    elif len(all_nums) == 1:
-                        due = int(all_nums[0])
-                
-                deck_stats = {
-                    'review': due,  # 'due' en AnkiWeb = review + learning
-                    'learning': learning,
-                    'new': new
-                }
-                
-                print(f"[DEBUG] Stats: due={due}, new={new}, learning={learning}")
-                
-                # Sumar al total general
+                # Sumar al total
                 stats['_total']['review'] += due
                 stats['_total']['learning'] += learning
                 stats['_total']['new'] += new
                 
-                # Verificar si este mazo coincide con algún curso
+                # Verificar si coincide con algún curso
                 for curso in cursos:
                     if match_course_in_deck(deck_name, curso):
-                        print(f"[DEBUG] ✓ COINCIDENCIA: '{deck_name}' -> '{curso}'")
+                        stats['_notas_internas'].append(f"✓ Mazo '{deck_name}' → {curso}")
                         stats['_mazos_encontrados'].append({
                             'mazo': deck_name,
                             'curso': curso,
-                            'stats': deck_stats
+                            'stats': {'review': due, 'learning': learning, 'new': new}
                         })
                         
-                        # Sumar estadísticas al curso
+                        # Sumar al curso
                         stats[curso]['review'] += due
                         stats[curso]['learning'] += learning
                         stats[curso]['new'] += new
                         break
+        else:
+            stats['_notas_internas'].append("⚠️ API no devolvió datos, intentando scraping...")
             
-            if len(deck_rows) == 0:
-                stats['_notas_internas'].append("No se encontraron mazos en la página")
-                # Guardar HTML para debug
-                print(f"[DEBUG] HTML completo: {resp.text[:2000]}")
+            # === MÉTODO 2: Scraping como fallback ===
+            try:
+                resp = self.session.get(self.DECKS_URL, timeout=15)
+                resp.raise_for_status()
+                stats['_notas_internas'].append(f"📄 Scraping: {len(resp.text)} chars HTML")
                 
-        except Exception as e:
-            print(f"[DEBUG] Error en get_stats_by_course: {e}")
-            import traceback
-            traceback.print_exc()
-            stats['_notas_internas'].append(f"Error: {str(e)}")
+                # Si el HTML es muy corto, es la página SPA sin datos
+                if len(resp.text) < 3000:
+                    stats['_notas_internas'].append("⚠️ Página SPA detectada (HTML corto)")
+                    
+            except Exception as e:
+                stats['_notas_internas'].append(f"❌ Error scraping: {str(e)}")
         
         # Registrar cursos sin mazos encontrados
         for curso in cursos:
