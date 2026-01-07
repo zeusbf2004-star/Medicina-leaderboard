@@ -904,6 +904,10 @@ class AnkiWebScraper:
                                 not '.js' in name.lower() and
                                 sum(1 for c in name if c.isalpha()) >= 2):
                                 all_decks.append(child)
+                                # Guardar referencia al hijo en el padre
+                                if 'children' not in result:
+                                    result['children'] = []
+                                result['children'].append(child)
                         # NO sumar contadores del hijo - los campos 7,8,9 ya tienen la suma
                     pos += length
                 else:
@@ -1003,10 +1007,23 @@ class AnkiWebScraper:
                 for curso in cursos:
                     if match_course_in_deck(deck_name, curso):
                         stats['_notas_internas'].append(f"✓ Mazo '{deck_name}' → {curso}")
+                        
+                        # Obtener lista de submazos (children)
+                        children = deck.get('children', [])
+                        submazos = []
+                        for child in children:
+                            submazos.append({
+                                'nombre': child.get('name', ''),
+                                'review': child.get('due', 0),
+                                'learning': child.get('learning', 0),
+                                'new': child.get('new', 0)
+                            })
+                        
                         stats['_mazos_encontrados'].append({
                             'mazo': deck_name,
                             'curso': curso,
-                            'stats': {'review': due, 'learning': learning, 'new': new}
+                            'stats': {'review': due, 'learning': learning, 'new': new},
+                            'submazos': submazos  # Lista de submazos con sus stats
                         })
                         
                         # Sumar al curso
@@ -1473,48 +1490,51 @@ def main():
             df = scores.get(curso_actual, pd.DataFrame())
             titulo = curso_actual
         
-        # Layout con dos columnas: Tabla principal + Submazos
-        col_main, col_submazos = st.columns([2, 1])
+        # Mostrar podio y tabla principal
+        render_podium(df, titulo)
+        st.markdown("---")
+        render_table(df)
         
-        with col_main:
-            render_podium(df, titulo)
-            st.markdown("---")
-            render_table(df)
-        
-        with col_submazos:
-            st.markdown("### 📋 Detalle de Mazos")
+        # Tabla desplegable de submazos (debajo de la clasificación)
+        if 'anki_raw' in st.session_state and curso_actual:
+            anki_raw = st.session_state.anki_raw
             
-            # Obtener submazos del primer estudiante (como referencia)
-            if 'anki_raw' in st.session_state:
-                anki_raw = st.session_state.anki_raw
-                
-                # Mostrar lista de mazos encontrados para el curso actual
-                with st.expander("📚 Submazos Encontrados", expanded=True):
-                    if curso_actual:
-                        # Buscar mazos que coinciden con el curso
-                        for student_name, student_data in anki_raw.items():
-                            if '_mazos_encontrados' in student_data:
-                                mazos_curso = [m for m in student_data['_mazos_encontrados'] 
-                                             if m.get('curso') == curso_actual]
-                                if mazos_curso:
-                                    st.markdown(f"**{student_name}**")
-                                    for mazo in mazos_curso:
-                                        stats = mazo.get('stats', {})
-                                        st.markdown(f"• {mazo['mazo']}")
-                                        st.caption(f"  R:{stats.get('review',0)} L:{stats.get('learning',0)} N:{stats.get('new',0)}")
-                                    break  # Solo mostrar del primer estudiante con datos
-                    else:
-                        # General: mostrar todos los mazos de todos los cursos
-                        for student_name, student_data in anki_raw.items():
-                            if '_mazos_encontrados' in student_data and student_data['_mazos_encontrados']:
-                                st.markdown(f"**{student_name}**")
-                                for mazo in student_data['_mazos_encontrados'][:10]:  # Limitar a 10
-                                    stats = mazo.get('stats', {})
-                                    st.markdown(f"• {mazo['mazo']} ({mazo['curso']})")
-                                    st.caption(f"  R:{stats.get('review',0)} L:{stats.get('learning',0)} N:{stats.get('new',0)}")
-                                break
-            else:
-                st.info("Actualiza los datos para ver submazos")
+            with st.expander("📚 Ver Detalle por Submazzos", expanded=False):
+                # Buscar mazos y submazos del curso actual
+                for student_name, student_data in anki_raw.items():
+                    if '_mazos_encontrados' in student_data:
+                        mazos_curso = [m for m in student_data['_mazos_encontrados'] 
+                                     if m.get('curso') == curso_actual]
+                        
+                        if mazos_curso:
+                            st.markdown(f"### 📊 Submazos de {student_name}")
+                            
+                            for mazo in mazos_curso:
+                                submazos = mazo.get('submazos', [])
+                                
+                                if submazos:
+                                    # Crear DataFrame para los submazos
+                                    submazo_data = []
+                                    for sub in submazos:
+                                        review = sub.get('review', 0)
+                                        learning = sub.get('learning', 0)
+                                        new = sub.get('new', 0)
+                                        pts = (review * REVIEW_MULTIPLIER) + (learning * LEARNING_MULTIPLIER) + (new * NEW_MULTIPLIER)
+                                        submazo_data.append({
+                                            'Submazo': sub.get('nombre', '')[:40],
+                                            'Review': review,
+                                            'Learning': learning,
+                                            'New': new,
+                                            'Pts': round(pts, 1)
+                                        })
+                                    
+                                    if submazo_data:
+                                        df_submazos = pd.DataFrame(submazo_data)
+                                        df_submazos = df_submazos.sort_values('Pts', ascending=False)
+                                        st.dataframe(df_submazos, use_container_width=True, hide_index=True)
+                                else:
+                                    st.info(f"No se encontraron submazos para {mazo['mazo']}")
+                            break  # Solo primer estudiante con datos
     else:
         st.markdown("""
         <div style="text-align:center;padding:3rem;color:#888;">
