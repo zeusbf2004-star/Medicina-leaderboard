@@ -855,8 +855,8 @@ class AnkiWebScraper:
                 shift += 7
             return value, pos
         
-        def parse_deck_message(data: bytes, start: int, end: int) -> Dict:
-            """Parsea un submensaje de mazo y extrae nombre y contadores."""
+        def parse_deck_message(data: bytes, start: int, end: int, all_decks: List[Dict]) -> Dict:
+            """Parsea un submensaje de mazo y extrae nombre, contadores, y submazos recursivamente."""
             result = {'name': '', 'due': 0, 'new': 0, 'learning': 0}
             pos = start
             
@@ -891,7 +891,17 @@ class AnkiWebScraper:
                             result['name'] = data[pos:pos+length].decode('utf-8')
                         except:
                             pass
-                    # Campo 3 = submazos, los ignoramos
+                    elif field_num == 3:  # Submazo - PARSEAR RECURSIVAMENTE
+                        child = parse_deck_message(data, pos, pos + length, all_decks)
+                        if child['name'] and len(child['name']) >= 2:
+                            # Filtrar nombres que parecen código
+                            name = child['name']
+                            if (not name.startswith('/') and
+                                not name.startswith('_app') and
+                                not 'svelte' in name.lower() and
+                                not '.js' in name.lower() and
+                                sum(1 for c in name if c.isalpha()) >= 2):
+                                all_decks.append(child)
                     pos += length
                 else:
                     # Otros wire types, avanzar
@@ -900,32 +910,30 @@ class AnkiWebScraper:
             return result
         
         try:
-            debug_msgs.append(f"🔍 Parseando {len(data)} bytes (estructura Protobuf)")
+            debug_msgs.append(f"🔍 Parseando {len(data)} bytes (recursivo)")
             
-            # Buscar todos los submensajes de mazos (tag 0x1a = campo 3, wire type 2)
+            # Lista para acumular todos los mazos (incluyendo submazos)
+            all_decks = []
+            
+            # El mensaje raíz tiene estructura diferente, buscar los mazos de nivel superior
             pos = 0
             while pos < len(data) - 2:
-                # Buscar el inicio de un submensaje de mazo
-                if data[pos] == 0x1a:  # Campo 3, string/submensaje
-                    msg_start = pos
+                if data[pos] == 0x1a:  # Campo 3, submensaje
                     pos += 1
-                    
-                    # Leer longitud del submensaje
                     length, pos = read_varint(data, pos)
                     
                     if length > 0 and length < 10000 and pos + length <= len(data):
-                        # Parsear el contenido del submensaje
-                        deck = parse_deck_message(data, pos, pos + length)
+                        # Parsear este mazo y sus hijos recursivamente
+                        deck = parse_deck_message(data, pos, pos + length, all_decks)
                         
                         if deck['name'] and len(deck['name']) >= 2:
-                            # Filtrar nombres que parecen código
                             name = deck['name']
                             if (not name.startswith('/') and
                                 not name.startswith('_app') and
                                 not 'svelte' in name.lower() and
                                 not '.js' in name.lower() and
                                 sum(1 for c in name if c.isalpha()) >= 2):
-                                decks.append(deck)
+                                all_decks.append(deck)
                         
                         pos += length
                     else:
@@ -933,13 +941,13 @@ class AnkiWebScraper:
                 else:
                     pos += 1
             
-            debug_msgs.append(f"✅ Mazos parseados: {len(decks)}")
+            debug_msgs.append(f"✅ Mazos parseados: {len(all_decks)}")
             
             # Mostrar primeros mazos para debug
-            for deck in decks[:5]:
+            for deck in all_decks[:5]:
                 debug_msgs.append(f"  📚 {deck['name'][:35]}: due={deck['due']}, new={deck['new']}, learn={deck['learning']}")
             
-            return decks
+            return all_decks
             
         except Exception as e:
             debug_msgs.append(f"💥 Error: {str(e)}")
