@@ -822,108 +822,122 @@ class AnkiWebScraper:
     
     def _parse_protobuf_decks(self, data: bytes, debug_msgs: List[str]) -> List[Dict]:
         """
-        Parsea la respuesta Protobuf de deck-list-info.
+        Parsea la respuesta Protobuf de deck-list-info de AnkiWeb.
         
-        Estrategia: buscar strings UTF-8 válidos en los bytes usando regex,
-        ignorando la estructura Protobuf estricta.
+        Estructura del mensaje Protobuf (deducida del análisis hex):
+        - Cada mazo es un submensaje que empieza con tag 0x1a (campo 3)
+        - Campo 1 (0x08): ID del mazo (varint)
+        - Campo 2 (0x12): Nombre del mazo (string)
+        - Campo 3 (0x1a): Submazos (submensaje repetido)
+        - Campos 4-9 (0x20-0x48): Contadores numéricos
+          - Campo 8 (0x40): new cards (tarjetas nuevas)
+          - Campo 7 (0x38): learn cards (en aprendizaje)
+          - Campo 4-6: review/due cards
         
         Args:
             data: Bytes de respuesta Protobuf
-            debug_msgs: Lista para agregar mensajes de debug
             
         Returns:
             Lista de diccionarios {name, due, new, learning}
         """
         decks = []
-        MAX_COUNTER = 99999
+        
+        def read_varint(data: bytes, pos: int) -> Tuple[int, int]:
+            """Lee un varint y retorna (valor, nueva_posición)."""
+            value = 0
+            shift = 0
+            while pos < len(data):
+                byte = data[pos]
+                value |= (byte & 0x7F) << shift
+                pos += 1
+                if not (byte & 0x80):
+                    break
+                shift += 7
+            return value, pos
+        
+        def parse_deck_message(data: bytes, start: int, end: int) -> Dict:
+            """Parsea un submensaje de mazo y extrae nombre y contadores."""
+            result = {'name': '', 'due': 0, 'new': 0, 'learning': 0}
+            pos = start
+            
+            while pos < end:
+                if pos >= len(data):
+                    break
+                    
+                tag_byte = data[pos]
+                field_num = tag_byte >> 3
+                wire_type = tag_byte & 0x07
+                pos += 1
+                
+                if wire_type == 0:  # Varint
+                    value, pos = read_varint(data, pos)
+                    # Mapeo de campos a contadores
+                    if field_num == 4:  # review_count o similar
+                        result['due'] += value
+                    elif field_num == 5:
+                        result['due'] += value
+                    elif field_num == 7:  # learn_count
+                        result['learning'] = value
+                    elif field_num == 8:  # new_count
+                        result['new'] = value
+                        
+                elif wire_type == 2:  # Length-delimited (string o submensaje)
+                    length, pos = read_varint(data, pos)
+                    if pos + length > end:
+                        break
+                    
+                    if field_num == 2:  # Nombre del mazo
+                        try:
+                            result['name'] = data[pos:pos+length].decode('utf-8')
+                        except:
+                            pass
+                    # Campo 3 = submazos, los ignoramos
+                    pos += length
+                else:
+                    # Otros wire types, avanzar
+                    pos += 1
+            
+            return result
         
         try:
-            debug_msgs.append(f"🔍 Parseando {len(data)} bytes")
+            debug_msgs.append(f"🔍 Parseando {len(data)} bytes (estructura Protobuf)")
             
-            # Decodificar todo el contenido ignorando errores
-            text_content = data.decode('utf-8', errors='replace')
-            
-            # Debug: mostrar una muestra del contenido
-            sample = text_content[:200].replace('\x00', '.').replace('\n', ' ')
-            debug_msgs.append(f"📝 Muestra: {sample[:100]}...")
-            
-            # Buscar nombres de mazos usando regex
-            # Los nombres de mazos suelen ser strings de texto legible
-            import re
-            
-            # Patrón para encontrar secuencias de texto legible (3+ caracteres alfanuméricos con espacios)
-            pattern = r'[A-Za-záéíóúñÁÉÍÓÚÑ][A-Za-záéíóúñÁÉÍÓÚÑ0-9\s\-\(\)\:\.\,]{2,50}'
-            
-            potential_names = re.findall(pattern, text_content)
-            debug_msgs.append(f"🔎 Patrones encontrados: {len(potential_names)}")
-            
-            # Filtrar nombres que parecen ser mazos válidos
-            seen_names = set()
-            for name in potential_names:
-                name = name.strip()
-                
-                # Validar que parece un nombre de mazo
-                if (len(name) >= 3 and
-                    len(name) <= 60 and
-                    sum(1 for c in name if c.isalpha()) >= 3 and  # Al menos 3 letras
-                    not name.lower().startswith('http') and
-                    not name.lower().startswith('www') and
-                    not '.js' in name.lower() and
-                    not '.mjs' in name.lower() and
-                    not 'svelte' in name.lower() and
-                    not 'chunk' in name.lower() and
-                    not 'immutable' in name.lower() and
-                    not 'entry' in name.lower() and
-                    not 'scheduler' in name.lower() and
-                    not 'module' in name.lower() and
-                    not name.startswith('_') and
-                    name not in seen_names):
+            # Buscar todos los submensajes de mazos (tag 0x1a = campo 3, wire type 2)
+            pos = 0
+            while pos < len(data) - 2:
+                # Buscar el inicio de un submensaje de mazo
+                if data[pos] == 0x1a:  # Campo 3, string/submensaje
+                    msg_start = pos
+                    pos += 1
                     
-                    # Encontrar la posición del nombre en el texto
-                    pos = text_content.find(name)
-                    seen_names.add(name)
-                    decks.append({
-                        'name': name,
-                        'due': 0,
-                        'new': 0,
-                        'learning': 0,
-                        'pos': pos  # Guardar posición para buscar números cercanos
-                    })
-            
-            debug_msgs.append(f"✅ Mazos candidatos: {len(decks)}")
-            
-            # Ordenar mazos por posición en el texto
-            decks.sort(key=lambda d: d.get('pos', 0))
-            
-            # Para cada mazo, buscar números que aparecen DESPUÉS de su nombre
-            # pero ANTES del siguiente mazo
-            for i, deck in enumerate(decks):
-                pos_start = deck.get('pos', 0) + len(deck['name'])
-                
-                # Encontrar donde termina la zona de este mazo (inicio del siguiente mazo)
-                if i + 1 < len(decks):
-                    pos_end = decks[i + 1].get('pos', len(text_content))
+                    # Leer longitud del submensaje
+                    length, pos = read_varint(data, pos)
+                    
+                    if length > 0 and length < 10000 and pos + length <= len(data):
+                        # Parsear el contenido del submensaje
+                        deck = parse_deck_message(data, pos, pos + length)
+                        
+                        if deck['name'] and len(deck['name']) >= 2:
+                            # Filtrar nombres que parecen código
+                            name = deck['name']
+                            if (not name.startswith('/') and
+                                not name.startswith('_app') and
+                                not 'svelte' in name.lower() and
+                                not '.js' in name.lower() and
+                                sum(1 for c in name if c.isalpha()) >= 2):
+                                decks.append(deck)
+                        
+                        pos += length
+                    else:
+                        pos += 1
                 else:
-                    pos_end = min(pos_start + 100, len(text_content))  # Máximo 100 chars después
-                
-                # Extraer el texto entre este mazo y el siguiente
-                segment = text_content[pos_start:pos_end]
-                
-                # Buscar números en este segmento
-                numbers = re.findall(r'\b(\d{1,5})\b', segment)
-                valid_numbers = [int(n) for n in numbers if int(n) <= MAX_COUNTER]
-                
-                # Asignar números (los primeros 2-3 números son due/new/learning)
-                if len(valid_numbers) >= 1:
-                    deck['due'] = valid_numbers[0]
-                if len(valid_numbers) >= 2:
-                    deck['new'] = valid_numbers[1]
-                if len(valid_numbers) >= 3:
-                    deck['learning'] = valid_numbers[2]
+                    pos += 1
+            
+            debug_msgs.append(f"✅ Mazos parseados: {len(decks)}")
             
             # Mostrar primeros mazos para debug
             for deck in decks[:5]:
-                debug_msgs.append(f"  📚 {deck['name'][:35]}: due={deck['due']}, new={deck['new']}")
+                debug_msgs.append(f"  📚 {deck['name'][:35]}: due={deck['due']}, new={deck['new']}, learn={deck['learning']}")
             
             return decks
             
