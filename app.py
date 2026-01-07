@@ -785,11 +785,10 @@ class AnkiWebScraper:
         """
         Parsea la respuesta Protobuf de deck-list-info.
         
-        Estructura Protobuf básica:
-        - Tag 0x0A (10): Campo string (nombres)
-        - Tag 0x08 (8): Campo varint (números)
-        - Tag 0x10 (16): Campo varint (números)
-        - Tag 0x18 (24): Campo varint (números)
+        Estrategia mejorada:
+        1. Buscar strings que parezcan nombres de mazos válidos
+        2. Extraer solo números razonables (< 100000)
+        3. Validar que no contengan caracteres de control
         
         Args:
             data: Bytes de respuesta Protobuf
@@ -799,96 +798,122 @@ class AnkiWebScraper:
             Lista de diccionarios {name, due, new, learning}
         """
         decks = []
+        MAX_COUNTER = 99999  # Máximo valor razonable para contadores
         
         try:
             debug_msgs.append(f"🔍 Parseando {len(data)} bytes de Protobuf")
             
-            # Estrategia: buscar strings que parezcan nombres de mazos
-            # y números cercanos que sean los contadores
-            
+            # Estrategia: buscar todos los strings UTF-8 válidos y filtrar los que parecen mazos
             i = 0
-            current_deck = None
+            found_strings = []
             
             while i < len(data):
-                tag = data[i]
-                
-                # Tag 0x0A = string (posible nombre de mazo)
-                if tag == 0x0A and i + 1 < len(data):
+                # Buscar tag 0x0A (string en Protobuf)
+                if data[i] == 0x0A and i + 1 < len(data):
                     length = data[i + 1]
-                    if i + 2 + length <= len(data):
+                    
+                    # Validar longitud razonable para un nombre de mazo
+                    if 2 <= length <= 100 and i + 2 + length <= len(data):
                         try:
-                            text = data[i + 2:i + 2 + length].decode('utf-8', errors='ignore')
-                            # Filtrar strings que parecen nombres de mazos (no URLs, no código)
-                            if (len(text) > 1 and 
-                                not text.startswith('/') and 
-                                not text.startswith('http') and
-                                not text.startswith('_') and
-                                not '.' in text[:5] and  # Evitar extensiones
-                                any(c.isalpha() for c in text)):
+                            raw_bytes = data[i + 2:i + 2 + length]
+                            text = raw_bytes.decode('utf-8', errors='strict')
+                            
+                            # Validación estricta: solo caracteres imprimibles y sin caracteres de control
+                            is_valid = True
+                            clean_text = ""
+                            
+                            for c in text:
+                                # Solo aceptar caracteres imprimibles normales
+                                if c.isprintable() or c in ' áéíóúñÁÉÍÓÚÑ':
+                                    clean_text += c
+                                elif ord(c) < 32:  # Caracteres de control
+                                    is_valid = False
+                                    break
+                            
+                            # El texto debe tener letras y ser razonablemente limpio
+                            if (is_valid and 
+                                len(clean_text) >= 2 and
+                                sum(1 for c in clean_text if c.isalpha()) >= 2 and
+                                not clean_text.startswith('/') and
+                                not clean_text.startswith('http') and
+                                not clean_text.startswith('_app') and
+                                not 'svelte' in clean_text.lower() and
+                                not 'chunk' in clean_text.lower() and
+                                not '.mjs' in clean_text and
+                                not '.js' in clean_text):
                                 
-                                # Guardar deck anterior si existe
-                                if current_deck and current_deck.get('name'):
-                                    decks.append(current_deck)
+                                # Buscar números cercanos (siguiente varint después del string)
+                                num_pos = i + 2 + length
+                                numbers = []
                                 
-                                current_deck = {
-                                    'name': text,
-                                    'due': 0,
-                                    'new': 0,
-                                    'learning': 0
-                                }
-                        except:
+                                # Buscar hasta 3 varints cercanos
+                                for _ in range(5):
+                                    if num_pos >= len(data):
+                                        break
+                                    
+                                    tag = data[num_pos]
+                                    
+                                    # Tags de varints comunes
+                                    if tag in (0x08, 0x10, 0x18, 0x20, 0x28, 0x30):
+                                        num_pos += 1
+                                        if num_pos < len(data):
+                                            # Leer varint (máximo 5 bytes para evitar números enormes)
+                                            value = 0
+                                            shift = 0
+                                            bytes_read = 0
+                                            
+                                            while num_pos < len(data) and bytes_read < 5:
+                                                byte = data[num_pos]
+                                                value |= (byte & 0x7F) << shift
+                                                num_pos += 1
+                                                bytes_read += 1
+                                                
+                                                if not (byte & 0x80):
+                                                    break
+                                                shift += 7
+                                            
+                                            # Solo aceptar números razonables
+                                            if 0 <= value <= MAX_COUNTER:
+                                                numbers.append(value)
+                                    else:
+                                        num_pos += 1
+                                
+                                found_strings.append({
+                                    'name': clean_text.strip(),
+                                    'numbers': numbers[:3],  # Máximo 3 números
+                                    'pos': i
+                                })
+                            
+                            i += 2 + length
+                            continue
+                            
+                        except (UnicodeDecodeError, Exception):
                             pass
-                        i += 2 + length
-                        continue
-                
-                # Tag 0x08, 0x10, 0x18 = varints (posibles contadores)
-                if tag in (0x08, 0x10, 0x18, 0x20, 0x28) and i + 1 < len(data):
-                    # Leer varint
-                    value = 0
-                    shift = 0
-                    j = i + 1
-                    while j < len(data):
-                        byte = data[j]
-                        value |= (byte & 0x7F) << shift
-                        j += 1
-                        if not (byte & 0x80):
-                            break
-                        shift += 7
-                    
-                    # Asignar al deck actual si existe
-                    if current_deck:
-                        if tag == 0x10 and current_deck['due'] == 0:
-                            current_deck['due'] = value
-                        elif tag == 0x18 and current_deck['new'] == 0:
-                            current_deck['new'] = value
-                        elif tag == 0x20:
-                            current_deck['learning'] = value
-                    
-                    i = j
-                    continue
                 
                 i += 1
             
-            # Agregar último deck
-            if current_deck and current_deck.get('name'):
-                decks.append(current_deck)
+            # Procesar strings encontrados para crear mazos
+            for item in found_strings:
+                name = item['name']
+                numbers = item['numbers']
+                
+                # Asignar números como due/new si existen
+                due = numbers[0] if len(numbers) > 0 else 0
+                new = numbers[1] if len(numbers) > 1 else 0
+                learning = numbers[2] if len(numbers) > 2 else 0
+                
+                decks.append({
+                    'name': name,
+                    'due': due,
+                    'new': new,
+                    'learning': learning
+                })
             
-            # Filtrar mazos válidos (con nombre y algún contador o que parezcan mazos reales)
-            valid_decks = []
-            for deck in decks:
-                name = deck.get('name', '')
-                # Filtrar nombres que no parecen mazos
-                if (len(name) >= 2 and 
-                    not name.startswith('svelte') and
-                    not 'chunk' in name.lower() and
-                    not 'module' in name.lower()):
-                    valid_decks.append(deck)
+            debug_msgs.append(f"✅ Mazos encontrados: {len(decks)}")
+            for deck in decks[:5]:
+                debug_msgs.append(f"  📚 {deck['name'][:30]}: due={deck['due']}, new={deck['new']}")
             
-            debug_msgs.append(f"✅ Mazos válidos encontrados: {len(valid_decks)}")
-            for deck in valid_decks[:5]:  # Mostrar primeros 5 para debug
-                debug_msgs.append(f"  📚 {deck['name']}: due={deck['due']}, new={deck['new']}")
-            
-            return valid_decks
+            return decks
             
         except Exception as e:
             debug_msgs.append(f"💥 Error parseando Protobuf: {str(e)}")
