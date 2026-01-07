@@ -46,10 +46,11 @@ CURSO_DECK_KEYWORDS = {
 }
 
 # Multiplicadores para el cálculo de score (Fórmula Médica)
-# Score = (Review * 0.8) + (Learning * 0.5) + (New * 0.2)
-REVIEW_MULTIPLIER = 0.8    # Tarjetas de repaso (verdes) - Mayor peso
+# Score = (Review * 1.0) + (Learning * 0.5) + (New * 0)
+# Las tarjetas NUEVAS no dan puntos - solo las que ya has estudiado
+REVIEW_MULTIPLIER = 1.0    # Tarjetas de repaso (verdes) - Peso completo
 LEARNING_MULTIPLIER = 0.5  # Tarjetas en aprendizaje (rojas) - Peso medio
-NEW_MULTIPLIER = 0.2       # Tarjetas nuevas (azules) - Menor peso
+NEW_MULTIPLIER = 0.0       # Tarjetas nuevas (azules) - NO dan puntos
 
 # Multiplicador para Notion (quices)
 NOTION_MULTIPLIER = 10
@@ -857,36 +858,47 @@ class AnkiWebScraper:
                     not name.startswith('_') and
                     name not in seen_names):
                     
+                    # Encontrar la posición del nombre en el texto
+                    pos = text_content.find(name)
                     seen_names.add(name)
                     decks.append({
                         'name': name,
                         'due': 0,
                         'new': 0,
-                        'learning': 0
+                        'learning': 0,
+                        'pos': pos  # Guardar posición para buscar números cercanos
                     })
             
             debug_msgs.append(f"✅ Mazos candidatos: {len(decks)}")
             
-            # Ahora buscar números en el contenido
-            # Los números de tarjetas suelen aparecer cerca de los nombres
-            numbers_pattern = r'\b(\d{1,5})\b'
-            all_numbers = [int(n) for n in re.findall(numbers_pattern, text_content) if int(n) <= MAX_COUNTER]
+            # Ordenar mazos por posición en el texto
+            decks.sort(key=lambda d: d.get('pos', 0))
             
-            debug_msgs.append(f"🔢 Números encontrados: {len(all_numbers)} (primeros 10: {all_numbers[:10]})")
-            
-            # Intentar asignar números a los mazos
-            # Estrategia simple: cada mazo tiene 2-3 números asociados
-            if all_numbers and decks:
-                num_idx = 0
-                for deck in decks:
-                    if num_idx < len(all_numbers):
-                        deck['due'] = all_numbers[num_idx]
-                        num_idx += 1
-                    if num_idx < len(all_numbers):
-                        deck['new'] = all_numbers[num_idx]
-                        num_idx += 1
-                    # Skip algunos números intermedios que pueden ser IDs
-                    num_idx += 1
+            # Para cada mazo, buscar números que aparecen DESPUÉS de su nombre
+            # pero ANTES del siguiente mazo
+            for i, deck in enumerate(decks):
+                pos_start = deck.get('pos', 0) + len(deck['name'])
+                
+                # Encontrar donde termina la zona de este mazo (inicio del siguiente mazo)
+                if i + 1 < len(decks):
+                    pos_end = decks[i + 1].get('pos', len(text_content))
+                else:
+                    pos_end = min(pos_start + 100, len(text_content))  # Máximo 100 chars después
+                
+                # Extraer el texto entre este mazo y el siguiente
+                segment = text_content[pos_start:pos_end]
+                
+                # Buscar números en este segmento
+                numbers = re.findall(r'\b(\d{1,5})\b', segment)
+                valid_numbers = [int(n) for n in numbers if int(n) <= MAX_COUNTER]
+                
+                # Asignar números (los primeros 2-3 números son due/new/learning)
+                if len(valid_numbers) >= 1:
+                    deck['due'] = valid_numbers[0]
+                if len(valid_numbers) >= 2:
+                    deck['new'] = valid_numbers[1]
+                if len(valid_numbers) >= 3:
+                    deck['learning'] = valid_numbers[2]
             
             # Mostrar primeros mazos para debug
             for deck in decks[:5]:
@@ -941,11 +953,6 @@ class AnkiWebScraper:
                 new = deck.get('new', 0)
                 learning = deck.get('learning', 0)
                 
-                # Sumar al total
-                stats['_total']['review'] += due
-                stats['_total']['learning'] += learning
-                stats['_total']['new'] += new
-                
                 # Verificar si coincide con algún curso
                 for curso in cursos:
                     if match_course_in_deck(deck_name, curso):
@@ -960,6 +967,11 @@ class AnkiWebScraper:
                         stats[curso]['review'] += due
                         stats[curso]['learning'] += learning
                         stats[curso]['new'] += new
+                        
+                        # Sumar al total SOLO si coincide con un curso
+                        stats['_total']['review'] += due
+                        stats['_total']['learning'] += learning
+                        stats['_total']['new'] += new
                         break
         else:
             stats['_notas_internas'].append("⚠️ API no devolvió datos, intentando scraping...")
