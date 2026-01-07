@@ -856,8 +856,8 @@ class AnkiWebScraper:
             return value, pos
         
         def parse_deck_message(data: bytes, start: int, end: int, all_decks: List[Dict]) -> Dict:
-            """Parsea un submensaje de mazo y extrae nombre, contadores, y submazos recursivamente.
-            Los contadores del padre incluyen la suma de todos los hijos."""
+            """Parsea un submensaje de mazo y extrae nombre y contadores.
+            Los campos 7, 8, 9 ya contienen la suma de todos los submazos (pre-calculada por AnkiWeb)."""
             result = {'name': '', 'due': 0, 'new': 0, 'learning': 0}
             pos = start
             
@@ -873,15 +873,16 @@ class AnkiWebScraper:
                 if wire_type == 0:  # Varint
                     value, pos = read_varint(data, pos)
                     # Mapeo de campos a contadores (basado en análisis hex)
+                    # Los campos ya contienen la suma de submazos
                     # Campo 7 (0x38): learning count
                     # Campo 8 (0x40): new count
                     # Campo 9 (0x48): due/review count
                     if field_num == 7:  # learn_count
-                        result['learning'] += value
+                        result['learning'] = value  # Usar = no += (evitar duplicación)
                     elif field_num == 8:  # new_count
-                        result['new'] += value
+                        result['new'] = value
                     elif field_num == 9:  # due/review count
-                        result['due'] += value
+                        result['due'] = value
                         
                 elif wire_type == 2:  # Length-delimited (string o submensaje)
                     length, pos = read_varint(data, pos)
@@ -904,11 +905,7 @@ class AnkiWebScraper:
                                 not '.js' in name.lower() and
                                 sum(1 for c in name if c.isalpha()) >= 2):
                                 all_decks.append(child)
-                        
-                        # SUMAR contadores del hijo al padre
-                        result['due'] += child['due']
-                        result['new'] += child['new']
-                        result['learning'] += child['learning']
+                        # NO sumar contadores del hijo - los campos 7,8,9 ya tienen la suma
                     pos += length
                 else:
                     # Otros wire types, avanzar
