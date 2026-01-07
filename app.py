@@ -1440,6 +1440,7 @@ def main():
                         notion = fetch_notion_scores(CURSOS)
                     
                     st.session_state.scores = calculate_scores(anki, notion, CURSOS)
+                    st.session_state.anki_raw = anki  # Guardar datos raw para submazos
                     st.session_state.last_update = datetime.now().strftime("%H:%M:%S")
                     st.success("✅ Datos actualizados")
                 except Exception as e:
@@ -1447,24 +1448,73 @@ def main():
     
     st.markdown("---")
     
-    # Pestañas
+    # Selector de vista (dropdown en lugar de pestañas)
     scores = st.session_state.scores
     
     if scores:
-        tabs = st.tabs(["🏆 General"] + [f"📚 {c}" for c in CURSOS])
+        # Dropdown para seleccionar vista
+        opciones = ["🏆 General"] + [f"📚 {c}" for c in CURSOS]
+        vista_seleccionada = st.selectbox(
+            "Seleccionar Vista",
+            opciones,
+            label_visibility="collapsed"
+        )
         
-        with tabs[0]:
+        st.markdown("---")
+        
+        # Determinar qué datos mostrar
+        if vista_seleccionada == "🏆 General":
             df = scores.get('_general', pd.DataFrame())
-            render_podium(df, "General")
+            titulo = "General"
+            curso_actual = None
+        else:
+            # Extraer nombre del curso sin el emoji
+            curso_actual = vista_seleccionada.replace("📚 ", "")
+            df = scores.get(curso_actual, pd.DataFrame())
+            titulo = curso_actual
+        
+        # Layout con dos columnas: Tabla principal + Submazos
+        col_main, col_submazos = st.columns([2, 1])
+        
+        with col_main:
+            render_podium(df, titulo)
             st.markdown("---")
             render_table(df)
         
-        for i, curso in enumerate(CURSOS):
-            with tabs[i + 1]:
-                df = scores.get(curso, pd.DataFrame())
-                render_podium(df, curso)
-                st.markdown("---")
-                render_table(df)
+        with col_submazos:
+            st.markdown("### 📋 Detalle de Mazos")
+            
+            # Obtener submazos del primer estudiante (como referencia)
+            if 'anki_raw' in st.session_state:
+                anki_raw = st.session_state.anki_raw
+                
+                # Mostrar lista de mazos encontrados para el curso actual
+                with st.expander("📚 Submazos Encontrados", expanded=True):
+                    if curso_actual:
+                        # Buscar mazos que coinciden con el curso
+                        for student_name, student_data in anki_raw.items():
+                            if '_mazos_encontrados' in student_data:
+                                mazos_curso = [m for m in student_data['_mazos_encontrados'] 
+                                             if m.get('curso') == curso_actual]
+                                if mazos_curso:
+                                    st.markdown(f"**{student_name}**")
+                                    for mazo in mazos_curso:
+                                        stats = mazo.get('stats', {})
+                                        st.markdown(f"• {mazo['mazo']}")
+                                        st.caption(f"  R:{stats.get('review',0)} L:{stats.get('learning',0)} N:{stats.get('new',0)}")
+                                    break  # Solo mostrar del primer estudiante con datos
+                    else:
+                        # General: mostrar todos los mazos de todos los cursos
+                        for student_name, student_data in anki_raw.items():
+                            if '_mazos_encontrados' in student_data and student_data['_mazos_encontrados']:
+                                st.markdown(f"**{student_name}**")
+                                for mazo in student_data['_mazos_encontrados'][:10]:  # Limitar a 10
+                                    stats = mazo.get('stats', {})
+                                    st.markdown(f"• {mazo['mazo']} ({mazo['curso']})")
+                                    st.caption(f"  R:{stats.get('review',0)} L:{stats.get('learning',0)} N:{stats.get('new',0)}")
+                                break
+            else:
+                st.info("Actualiza los datos para ver submazos")
     else:
         st.markdown("""
         <div style="text-align:center;padding:3rem;color:#888;">
