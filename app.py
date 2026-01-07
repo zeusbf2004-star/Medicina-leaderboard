@@ -871,15 +871,16 @@ class AnkiWebScraper:
                 
                 if wire_type == 0:  # Varint
                     value, pos = read_varint(data, pos)
-                    # Mapeo de campos a contadores
-                    if field_num == 4:  # review_count o similar
-                        result['due'] += value
-                    elif field_num == 5:
-                        result['due'] += value
-                    elif field_num == 7:  # learn_count
+                    # Mapeo de campos a contadores (basado en análisis hex)
+                    # Campo 7 (0x38): learning count
+                    # Campo 8 (0x40): new count
+                    # Campo 9 (0x48): due/review count
+                    if field_num == 7:  # learn_count
                         result['learning'] = value
                     elif field_num == 8:  # new_count
                         result['new'] = value
+                    elif field_num == 9:  # due/review count
+                        result['due'] = value
                         
                 elif wire_type == 2:  # Length-delimited (string o submensaje)
                     length, pos = read_varint(data, pos)
