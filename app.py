@@ -787,6 +787,27 @@ class AnkiWebScraper:
             resp = self.session.post(url, data=b'', headers=headers, timeout=15)
             debug_msgs.append(f"📡 API Response: {resp.status_code}, {len(resp.content)} bytes")
             
+            # DEBUG: Mostrar bytes hexadecimales de los primeros 200 bytes
+            hex_preview = resp.content[:200].hex()
+            debug_msgs.append(f"🔢 Hex (primeros 200): {hex_preview[:100]}...")
+            
+            # DEBUG: Buscar "Fisiopatología Uribe" en los datos
+            search_term = "Fisiopatología Uribe"
+            try:
+                pos = resp.content.find(search_term.encode('utf-8'))
+                if pos >= 0:
+                    # Mostrar 50 bytes antes y 50 después del nombre
+                    start = max(0, pos - 20)
+                    end = min(len(resp.content), pos + len(search_term) + 50)
+                    context = resp.content[start:end]
+                    debug_msgs.append(f"🎯 '{search_term}' encontrado en pos {pos}")
+                    debug_msgs.append(f"📋 Contexto hex: {context.hex()}")
+                    debug_msgs.append(f"📋 Contexto txt: {context.decode('utf-8', errors='replace')}")
+                else:
+                    debug_msgs.append(f"❌ '{search_term}' NO encontrado en bytes")
+            except Exception as e:
+                debug_msgs.append(f"❌ Error buscando: {e}")
+            
             if resp.status_code == 200 and resp.content:
                 decks = self._parse_protobuf_decks(resp.content, debug_msgs)
                 debug_msgs.append(f"📊 Mazos parseados: {len(decks)}")
