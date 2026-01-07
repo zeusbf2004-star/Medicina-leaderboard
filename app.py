@@ -785,10 +785,8 @@ class AnkiWebScraper:
         """
         Parsea la respuesta Protobuf de deck-list-info.
         
-        Estrategia mejorada:
-        1. Buscar strings que parezcan nombres de mazos válidos
-        2. Extraer solo números razonables (< 100000)
-        3. Validar que no contengan caracteres de control
+        Estrategia: buscar strings UTF-8 válidos en los bytes usando regex,
+        ignorando la estructura Protobuf estricta.
         
         Args:
             data: Bytes de respuesta Protobuf
@@ -798,125 +796,91 @@ class AnkiWebScraper:
             Lista de diccionarios {name, due, new, learning}
         """
         decks = []
-        MAX_COUNTER = 99999  # Máximo valor razonable para contadores
+        MAX_COUNTER = 99999
         
         try:
-            debug_msgs.append(f"🔍 Parseando {len(data)} bytes de Protobuf")
+            debug_msgs.append(f"🔍 Parseando {len(data)} bytes")
             
-            # Estrategia: buscar todos los strings UTF-8 válidos y filtrar los que parecen mazos
-            i = 0
-            found_strings = []
+            # Decodificar todo el contenido ignorando errores
+            text_content = data.decode('utf-8', errors='replace')
             
-            while i < len(data):
-                # Buscar tag 0x0A (string en Protobuf)
-                if data[i] == 0x0A and i + 1 < len(data):
-                    length = data[i + 1]
+            # Debug: mostrar una muestra del contenido
+            sample = text_content[:200].replace('\x00', '.').replace('\n', ' ')
+            debug_msgs.append(f"📝 Muestra: {sample[:100]}...")
+            
+            # Buscar nombres de mazos usando regex
+            # Los nombres de mazos suelen ser strings de texto legible
+            import re
+            
+            # Patrón para encontrar secuencias de texto legible (3+ caracteres alfanuméricos con espacios)
+            pattern = r'[A-Za-záéíóúñÁÉÍÓÚÑ][A-Za-záéíóúñÁÉÍÓÚÑ0-9\s\-\(\)\:\.\,]{2,50}'
+            
+            potential_names = re.findall(pattern, text_content)
+            debug_msgs.append(f"🔎 Patrones encontrados: {len(potential_names)}")
+            
+            # Filtrar nombres que parecen ser mazos válidos
+            seen_names = set()
+            for name in potential_names:
+                name = name.strip()
+                
+                # Validar que parece un nombre de mazo
+                if (len(name) >= 3 and
+                    len(name) <= 60 and
+                    sum(1 for c in name if c.isalpha()) >= 3 and  # Al menos 3 letras
+                    not name.lower().startswith('http') and
+                    not name.lower().startswith('www') and
+                    not '.js' in name.lower() and
+                    not '.mjs' in name.lower() and
+                    not 'svelte' in name.lower() and
+                    not 'chunk' in name.lower() and
+                    not 'immutable' in name.lower() and
+                    not 'entry' in name.lower() and
+                    not 'scheduler' in name.lower() and
+                    not 'module' in name.lower() and
+                    not name.startswith('_') and
+                    name not in seen_names):
                     
-                    # Validar longitud razonable para un nombre de mazo
-                    if 2 <= length <= 100 and i + 2 + length <= len(data):
-                        try:
-                            raw_bytes = data[i + 2:i + 2 + length]
-                            text = raw_bytes.decode('utf-8', errors='strict')
-                            
-                            # Validación estricta: solo caracteres imprimibles y sin caracteres de control
-                            is_valid = True
-                            clean_text = ""
-                            
-                            for c in text:
-                                # Solo aceptar caracteres imprimibles normales
-                                if c.isprintable() or c in ' áéíóúñÁÉÍÓÚÑ':
-                                    clean_text += c
-                                elif ord(c) < 32:  # Caracteres de control
-                                    is_valid = False
-                                    break
-                            
-                            # El texto debe tener letras y ser razonablemente limpio
-                            if (is_valid and 
-                                len(clean_text) >= 2 and
-                                sum(1 for c in clean_text if c.isalpha()) >= 2 and
-                                not clean_text.startswith('/') and
-                                not clean_text.startswith('http') and
-                                not clean_text.startswith('_app') and
-                                not 'svelte' in clean_text.lower() and
-                                not 'chunk' in clean_text.lower() and
-                                not '.mjs' in clean_text and
-                                not '.js' in clean_text):
-                                
-                                # Buscar números cercanos (siguiente varint después del string)
-                                num_pos = i + 2 + length
-                                numbers = []
-                                
-                                # Buscar hasta 3 varints cercanos
-                                for _ in range(5):
-                                    if num_pos >= len(data):
-                                        break
-                                    
-                                    tag = data[num_pos]
-                                    
-                                    # Tags de varints comunes
-                                    if tag in (0x08, 0x10, 0x18, 0x20, 0x28, 0x30):
-                                        num_pos += 1
-                                        if num_pos < len(data):
-                                            # Leer varint (máximo 5 bytes para evitar números enormes)
-                                            value = 0
-                                            shift = 0
-                                            bytes_read = 0
-                                            
-                                            while num_pos < len(data) and bytes_read < 5:
-                                                byte = data[num_pos]
-                                                value |= (byte & 0x7F) << shift
-                                                num_pos += 1
-                                                bytes_read += 1
-                                                
-                                                if not (byte & 0x80):
-                                                    break
-                                                shift += 7
-                                            
-                                            # Solo aceptar números razonables
-                                            if 0 <= value <= MAX_COUNTER:
-                                                numbers.append(value)
-                                    else:
-                                        num_pos += 1
-                                
-                                found_strings.append({
-                                    'name': clean_text.strip(),
-                                    'numbers': numbers[:3],  # Máximo 3 números
-                                    'pos': i
-                                })
-                            
-                            i += 2 + length
-                            continue
-                            
-                        except (UnicodeDecodeError, Exception):
-                            pass
-                
-                i += 1
+                    seen_names.add(name)
+                    decks.append({
+                        'name': name,
+                        'due': 0,
+                        'new': 0,
+                        'learning': 0
+                    })
             
-            # Procesar strings encontrados para crear mazos
-            for item in found_strings:
-                name = item['name']
-                numbers = item['numbers']
-                
-                # Asignar números como due/new si existen
-                due = numbers[0] if len(numbers) > 0 else 0
-                new = numbers[1] if len(numbers) > 1 else 0
-                learning = numbers[2] if len(numbers) > 2 else 0
-                
-                decks.append({
-                    'name': name,
-                    'due': due,
-                    'new': new,
-                    'learning': learning
-                })
+            debug_msgs.append(f"✅ Mazos candidatos: {len(decks)}")
             
-            debug_msgs.append(f"✅ Mazos encontrados: {len(decks)}")
+            # Ahora buscar números en el contenido
+            # Los números de tarjetas suelen aparecer cerca de los nombres
+            numbers_pattern = r'\b(\d{1,5})\b'
+            all_numbers = [int(n) for n in re.findall(numbers_pattern, text_content) if int(n) <= MAX_COUNTER]
+            
+            debug_msgs.append(f"🔢 Números encontrados: {len(all_numbers)} (primeros 10: {all_numbers[:10]})")
+            
+            # Intentar asignar números a los mazos
+            # Estrategia simple: cada mazo tiene 2-3 números asociados
+            if all_numbers and decks:
+                num_idx = 0
+                for deck in decks:
+                    if num_idx < len(all_numbers):
+                        deck['due'] = all_numbers[num_idx]
+                        num_idx += 1
+                    if num_idx < len(all_numbers):
+                        deck['new'] = all_numbers[num_idx]
+                        num_idx += 1
+                    # Skip algunos números intermedios que pueden ser IDs
+                    num_idx += 1
+            
+            # Mostrar primeros mazos para debug
             for deck in decks[:5]:
-                debug_msgs.append(f"  📚 {deck['name'][:30]}: due={deck['due']}, new={deck['new']}")
+                debug_msgs.append(f"  📚 {deck['name'][:35]}: due={deck['due']}, new={deck['new']}")
             
             return decks
             
         except Exception as e:
-            debug_msgs.append(f"💥 Error parseando Protobuf: {str(e)}")
+            debug_msgs.append(f"💥 Error: {str(e)}")
+            import traceback
+            debug_msgs.append(traceback.format_exc()[:200])
             return []
     
     def get_stats_by_course(self, cursos: List[str]) -> Dict[str, Dict[str, int]]:
