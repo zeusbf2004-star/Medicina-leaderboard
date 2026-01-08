@@ -1020,16 +1020,29 @@ class AnkiWebScraper:
                         
                         # Obtener lista de submazos (children)
                         # Estructura: Curso → Teoría → Temas
-                        # Buscamos los temas que están dentro del submazo "Teoría"
+                        # Buscamos SOLO el submazo "Teoría" y sus hijos
                         children = deck.get('children', [])
                         submazos = []
+                        
+                        # Variables para stats de SOLO Teoría
+                        teoria_due = 0
+                        teoria_learning = 0
+                        teoria_new = 0
+                        teoria_encontrada = False
                         
                         for child in children:
                             child_name = child.get('name', '').lower()
                             
-                            # SOLO obtener submazos del hijo "Teoría"
+                            # SOLO usar el submazo "Teoría"
                             # Ignorar otros hijos como "Láminas", "Práctica", etc.
                             if 'teoría' in child_name or 'teoria' in child_name:
+                                teoria_encontrada = True
+                                # Usar stats del submazo Teoría (no del padre)
+                                teoria_due = child.get('due', 0)
+                                teoria_learning = child.get('learning', 0)
+                                teoria_new = child.get('new', 0)
+                                
+                                # Obtener los temas (nietos)
                                 nietos = child.get('children', [])
                                 for nieto in nietos:
                                     submazos.append({
@@ -1038,23 +1051,30 @@ class AnkiWebScraper:
                                         'learning': nieto.get('learning', 0),
                                         'new': nieto.get('new', 0)
                                     })
+                                break  # Solo necesitamos el primer "Teoría"
+                        
+                        # Si no se encontró Teoría, usar los stats del mazo completo como fallback
+                        if not teoria_encontrada:
+                            teoria_due = due
+                            teoria_learning = learning
+                            teoria_new = new
                         
                         stats['_mazos_encontrados'].append({
                             'mazo': deck_name,
                             'curso': curso,
-                            'stats': {'review': due, 'learning': learning, 'new': new},
+                            'stats': {'review': teoria_due, 'learning': teoria_learning, 'new': teoria_new},
                             'submazos': submazos  # Lista de submazos/temas con sus stats
                         })
                         
-                        # Sumar al curso
-                        stats[curso]['review'] += due
-                        stats[curso]['learning'] += learning
-                        stats[curso]['new'] += new
+                        # Sumar al curso SOLO stats de Teoría
+                        stats[curso]['review'] += teoria_due
+                        stats[curso]['learning'] += teoria_learning
+                        stats[curso]['new'] += teoria_new
                         
                         # Sumar al total SOLO si coincide con un curso
-                        stats['_total']['review'] += due
-                        stats['_total']['learning'] += learning
-                        stats['_total']['new'] += new
+                        stats['_total']['review'] += teoria_due
+                        stats['_total']['learning'] += teoria_learning
+                        stats['_total']['new'] += teoria_new
                         break
         else:
             stats['_notas_internas'].append("⚠️ API no devolvió datos, intentando scraping...")
