@@ -1027,7 +1027,8 @@ class AnkiWebScraper:
                         for child in children:
                             child_name = child.get('name', '').lower()
                             
-                            # Si el hijo es "Teoría", obtener sus hijos (nietos = temas)
+                            # SOLO obtener submazos del hijo "Teoría"
+                            # Ignorar otros hijos como "Láminas", "Práctica", etc.
                             if 'teoría' in child_name or 'teoria' in child_name:
                                 nietos = child.get('children', [])
                                 for nieto in nietos:
@@ -1037,14 +1038,6 @@ class AnkiWebScraper:
                                         'learning': nieto.get('learning', 0),
                                         'new': nieto.get('new', 0)
                                     })
-                            else:
-                                # Si no es Teoría, agregar el hijo directamente
-                                submazos.append({
-                                    'nombre': child.get('name', ''),
-                                    'review': child.get('due', 0),
-                                    'learning': child.get('learning', 0),
-                                    'new': child.get('new', 0)
-                                })
                         
                         stats['_mazos_encontrados'].append({
                             'mazo': deck_name,
