@@ -22,27 +22,35 @@ from typing import Dict, List, Optional, Tuple
 # ============================================================================
 
 # Lista de cursos disponibles
-CURSOS = ["Fisiopatología", "Epidemiología", "Farmacología", "Patología"]
+CURSOS = [
+    "Anatomía",
+    "Histología", 
+    "Embriología",
+    "Bioquímica",
+    "Fisiología",
+    "Patología",
+    "Farmacología",
+    "Microbiología",
+    "Parasitología"
+]
 
 # Palabras clave para identificar mazos en AnkiWeb (mapeo curso -> palabras clave)
 # 
 # IMPORTANTE: Usa nombres EXACTOS de mazos para evitar falsos positivos
-# - Prefijo "=" indica coincidencia EXACTA (ej: "=Fisiopatología Uribe")
+# - Prefijo "=" indica coincidencia EXACTA (ej: "=Anatomía humana Pró")
 # - Sin prefijo indica que el mazo debe CONTENER la palabra clave
 #
-# Esto permite encontrar mazos independientemente de su jerarquía (::)
+# Estructura esperada: Curso -> Teoría -> Temas (submazos)
 CURSO_DECK_KEYWORDS = {
-    # Para Fisiopatología: SOLO el mazo específico "Fisiopatología Uribe"
-    "Fisiopatología": ["=Fisiopatología Uribe", "=fisiopatologia uribe"],
-    
-    # Para Epidemiología: SOLO mazos que se llamen exactamente "Epidemiología"
-    "Epidemiología": ["=Epidemiología", "=epidemiologia"],
-    
-    # Para Farmacología: SOLO mazos que se llamen exactamente "Farmacología" o "Farmacología médica"
-    "Farmacología": ["=Farmacología", "=Farmacología médica", "=farmacologia", "=farmacologia medica"],
-    
-    # Para Patología: SOLO mazos que se llamen exactamente "Patología" o "Patología general"
-    "Patología": ["=Patología", "=Patología general", "=Patología clínica", "=patologia"],
+    "Anatomía": ["=Anatomía humana Pró", "=anatomía humana pró", "=Anatomia humana Pro"],
+    "Histología": ["=Histología Ross", "=histología ross", "=Histologia Ross"],
+    "Embriología": ["=Embriología humana Moore", "=embriología humana moore", "=Embriologia humana Moore"],
+    "Bioquímica": ["=Bioquímica Harper", "=bioquímica harper", "=Bioquimica Harper"],
+    "Fisiología": ["=Fisiología humana Harper", "=fisiología humana harper", "=Fisiologia humana Harper"],
+    "Patología": ["=Patología general Robbins", "=patología general robbins", "=Patologia general Robbins"],
+    "Farmacología": ["=Farmacología médica Goodman", "=farmacología médica goodman", "=Farmacologia medica Goodman"],
+    "Microbiología": ["=Microbiología médica Murray", "=microbiología médica murray", "=Microbiologia medica Murray"],
+    "Parasitología": ["=Parasitología médica Becerril", "=parasitología médica becerril", "=Parasitologia medica Becerril"],
 }
 
 # Multiplicadores para el cálculo de score (Fórmula Médica)
@@ -1009,21 +1017,38 @@ class AnkiWebScraper:
                         stats['_notas_internas'].append(f"✓ Mazo '{deck_name}' → {curso}")
                         
                         # Obtener lista de submazos (children)
+                        # Estructura: Curso → Teoría → Temas
+                        # Buscamos los temas que están dentro del submazo "Teoría"
                         children = deck.get('children', [])
                         submazos = []
+                        
                         for child in children:
-                            submazos.append({
-                                'nombre': child.get('name', ''),
-                                'review': child.get('due', 0),
-                                'learning': child.get('learning', 0),
-                                'new': child.get('new', 0)
-                            })
+                            child_name = child.get('name', '').lower()
+                            
+                            # Si el hijo es "Teoría", obtener sus hijos (nietos = temas)
+                            if 'teoría' in child_name or 'teoria' in child_name:
+                                nietos = child.get('children', [])
+                                for nieto in nietos:
+                                    submazos.append({
+                                        'nombre': nieto.get('name', ''),
+                                        'review': nieto.get('due', 0),
+                                        'learning': nieto.get('learning', 0),
+                                        'new': nieto.get('new', 0)
+                                    })
+                            else:
+                                # Si no es Teoría, agregar el hijo directamente
+                                submazos.append({
+                                    'nombre': child.get('name', ''),
+                                    'review': child.get('due', 0),
+                                    'learning': child.get('learning', 0),
+                                    'new': child.get('new', 0)
+                                })
                         
                         stats['_mazos_encontrados'].append({
                             'mazo': deck_name,
                             'curso': curso,
                             'stats': {'review': due, 'learning': learning, 'new': new},
-                            'submazos': submazos  # Lista de submazos con sus stats
+                            'submazos': submazos  # Lista de submazos/temas con sus stats
                         })
                         
                         # Sumar al curso
