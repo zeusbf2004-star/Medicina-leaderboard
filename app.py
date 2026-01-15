@@ -69,6 +69,13 @@ NOTION_MULTIPLIER = 10
 NOTION_API_VERSION = "2022-06-28"
 NOTION_API_BASE_URL = "https://api.notion.com/v1"
 
+# Discord Webhook Configuration
+DISCORD_WEBHOOK_URL_KEY = "DISCORD_WEBHOOK_URL"
+
+# Multiplicador para tarjetas completadas (delta scoring)
+# Se calculan puntos por la diferencia entre tarjetas pendientes anteriores y actuales
+COMPLETED_MULTIPLIER = 0.8  # Puntos por cada tarjeta completada
+
 
 # ============================================================================
 # FUNCIONES DE UTILIDAD
@@ -147,6 +154,177 @@ def get_secrets() -> Tuple[Optional[str], Optional[str]]:
         pass
     
     return notion_token, database_id
+
+
+# ============================================================================
+# NOTIFICACIONES DISCORD
+# ============================================================================
+
+def get_discord_webhook() -> Optional[str]:
+    """
+    Obtiene la URL del webhook de Discord de los secretos.
+    
+    Returns:
+        URL del webhook o None si no está configurado
+    """
+    try:
+        return st.secrets.get(DISCORD_WEBHOOK_URL_KEY)
+    except (FileNotFoundError, Exception):
+        return None
+
+
+def send_discord_notification(
+    title: str, 
+    description: str, 
+    fields: List[Dict] = None, 
+    color: int = 0x00D2FF,
+    footer: str = None
+) -> Tuple[bool, str]:
+    """
+    Envía una notificación a Discord via webhook.
+    
+    Args:
+        title: Título del embed
+        description: Descripción principal
+        fields: Lista de campos [{name, value, inline}]
+        color: Color del embed en formato hex
+        footer: Texto del footer
+        
+    Returns:
+        Tuple (éxito, mensaje)
+    """
+    webhook_url = get_discord_webhook()
+    
+    if not webhook_url:
+        return False, "Webhook de Discord no configurado"
+    
+    # Construir embed
+    embed = {
+        "title": title,
+        "description": description,
+        "color": color,
+        "timestamp": datetime.now().isoformat()
+    }
+    
+    if fields:
+        embed["fields"] = fields
+    
+    if footer:
+        embed["footer"] = {"text": footer}
+    
+    payload = {
+        "embeds": [embed],
+        "username": "🏆 Competencia Académica"
+    }
+    
+    try:
+        response = requests.post(
+            webhook_url,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
+        
+        if response.status_code in (200, 204):
+            return True, "Notificación enviada"
+        else:
+            return False, f"Error HTTP {response.status_code}"
+            
+    except requests.Timeout:
+        return False, "Timeout al conectar con Discord"
+    except requests.RequestException as e:
+        return False, f"Error de conexión: {str(e)}"
+
+
+def build_ranking_embed(
+    scores: Dict[str, 'pd.DataFrame'], 
+    curso: str = None,
+    include_delta: bool = False
+) -> Tuple[str, str, List[Dict]]:
+    """
+    Construye los datos para un embed de Discord con el ranking.
+    
+    Args:
+        scores: Dict con DataFrames de scores por curso
+        curso: Nombre del curso específico o None para general
+        include_delta: Si incluir información de tarjetas completadas
+        
+    Returns:
+        Tuple (título, descripción, campos)
+    """
+    medals = ['🥇', '🥈', '🥉', '4️⃣', '5️⃣']
+    
+    if curso:
+        df = scores.get(curso, pd.DataFrame())
+        title = f"📚 Ranking de {curso}"
+    else:
+        df = scores.get('_general', pd.DataFrame())
+        title = "🏆 Ranking General"
+    
+    if df.empty:
+        return title, "Sin datos disponibles", []
+    
+    # Construir descripción con top 5
+    lines = []
+    for i, (_, row) in enumerate(df.head(5).iterrows()):
+        medal = medals[i] if i < len(medals) else f"{i+1}."
+        student = row['Estudiante']
+        score = row['Score']
+        
+        # Añadir info de delta si está disponible
+        delta_info = ""
+        if include_delta and 'Completadas' in row:
+            completadas = row.get('Completadas', 0)
+            if completadas > 0:
+                delta_info = f" (+{completadas})"
+        
+        lines.append(f"{medal} **{student}**: {score} pts{delta_info}")
+    
+    description = "\n".join(lines)
+    
+    # Campos adicionales
+    fields = [
+        {
+            "name": "📊 Total Participantes",
+            "value": str(len(df)),
+            "inline": True
+        },
+        {
+            "name": "🕐 Actualizado",
+            "value": datetime.now().strftime("%H:%M:%S"),
+            "inline": True
+        }
+    ]
+    
+    return title, description, fields
+
+
+def notify_ranking_to_discord(scores: Dict, curso: str = None) -> Tuple[bool, str]:
+    """
+    Envía el ranking actual a Discord.
+    
+    Args:
+        scores: Dict con DataFrames de scores
+        curso: Curso específico o None para general
+        
+    Returns:
+        Tuple (éxito, mensaje)
+    """
+    title, description, fields = build_ranking_embed(scores, curso)
+    
+    # Color según el curso
+    if curso:
+        color = 0x3A7BD5  # Azul para cursos específicos
+    else:
+        color = 0xFFD700  # Dorado para ranking general
+    
+    return send_discord_notification(
+        title=title,
+        description=description,
+        fields=fields,
+        color=color,
+        footer="Dashboard de Competencia Académica • Medicina"
+    )
 
 
 # ============================================================================
@@ -1247,13 +1425,60 @@ def fetch_anki_stats(students: List[Dict], cursos: List[str]) -> Dict:
 # CÁLCULO DE PUNTAJES
 # ============================================================================
 
-def calculate_scores(anki: Dict, notion: Dict, cursos: List[str]) -> Dict[str, pd.DataFrame]:
+def calculate_delta(current: Dict, previous: Dict, key: str) -> int:
+    """
+    Calcula las tarjetas completadas (delta) entre dos snapshots.
+    
+    Si las tarjetas pendientes actuales son MENOS que antes,
+    significa que el usuario completó tarjetas.
+    
+    Args:
+        current: Stats actuales {review, learning, new}
+        previous: Stats anteriores {review, learning, new}
+        key: Clave del curso o '_total'
+        
+    Returns:
+        Número de tarjetas completadas (delta positivo)
+    """
+    if not previous:
+        return 0
+    
+    curr = current.get(key, {'review': 0, 'learning': 0, 'new': 0})
+    prev = previous.get(key, {'review': 0, 'learning': 0, 'new': 0})
+    
+    # Total pendientes = review + learning + new
+    curr_total = curr.get('review', 0) + curr.get('learning', 0) + curr.get('new', 0)
+    prev_total = prev.get('review', 0) + prev.get('learning', 0) + prev.get('new', 0)
+    
+    # Delta = tarjetas que ya no están pendientes (completadas)
+    delta = prev_total - curr_total
+    
+    # Solo contar si es positivo (tarjetas completadas)
+    return max(0, delta)
+
+
+def calculate_scores(
+    anki: Dict, 
+    notion: Dict, 
+    cursos: List[str],
+    previous_anki: Dict = None
+) -> Dict[str, pd.DataFrame]:
     """
     Calcula scores por curso y general usando la Fórmula Médica.
     
     Fórmula:
-    Score Anki = (Review * 0.8) + (Learning * 0.5) + (New * 0.2)
-    Score Total = Score Anki + (Quices * 10)
+    Score Anki = (Review * 1.0) + (Learning * 0.5) + (New * 0)
+    Score Completadas = Tarjetas completadas * 0.8
+    Score Total = Score Anki + Score Completadas + (Quices * 10)
+    
+    Args:
+        anki: Stats actuales de AnkiWeb por estudiante
+        notion: Scores de Notion por estudiante
+        cursos: Lista de cursos
+        previous_anki: Stats anteriores para calcular delta (opcional)
+        
+    Returns:
+        Dict con DataFrames de scores por curso y general
     """
     all_students = set(anki.keys()) | set(notion.keys())
     results = {}
@@ -1263,27 +1488,40 @@ def calculate_scores(anki: Dict, notion: Dict, cursos: List[str]) -> Dict[str, p
         data = []
         for student in all_students:
             a = anki.get(student, {}).get(curso, {'review': 0, 'learning': 0, 'new': 0})
+            prev_student = previous_anki.get(student, {}) if previous_anki else {}
             
             # Extraer contadores
             review = a.get('review', 0)
             learning = a.get('learning', 0)
             new = a.get('new', 0)
             
+            # Calcular delta (tarjetas completadas)
+            delta = calculate_delta(
+                anki.get(student, {}), 
+                prev_student, 
+                curso
+            )
+            
             # Fórmula Médica para Anki
             anki_pts = (review * REVIEW_MULTIPLIER) + (learning * LEARNING_MULTIPLIER) + (new * NEW_MULTIPLIER)
+            
+            # Puntos por tarjetas completadas
+            delta_pts = delta * COMPLETED_MULTIPLIER
             
             # Puntaje de Notion (quices)
             n = notion.get(student, {}).get(curso, 0)
             notion_pts = n * NOTION_MULTIPLIER
             
-            total = anki_pts + notion_pts
+            total = anki_pts + delta_pts + notion_pts
             
             data.append({
                 'Estudiante': student,
                 'Review': review,
                 'Learning': learning,
                 'New': new,
+                'Completadas': delta,
                 'Pts Anki': round(anki_pts, 1),
+                'Pts Delta': round(delta_pts, 1),
                 'Quices': n,
                 'Pts Notion': round(notion_pts, 1),
                 'Score': round(total, 1)
@@ -1299,27 +1537,40 @@ def calculate_scores(anki: Dict, notion: Dict, cursos: List[str]) -> Dict[str, p
     data = []
     for student in all_students:
         a_total = anki.get(student, {}).get('_total', {'review': 0, 'learning': 0, 'new': 0})
+        prev_student = previous_anki.get(student, {}) if previous_anki else {}
         
         # Extraer contadores totales
         review = a_total.get('review', 0)
         learning = a_total.get('learning', 0)
         new = a_total.get('new', 0)
         
+        # Calcular delta total
+        delta = calculate_delta(
+            anki.get(student, {}),
+            prev_student,
+            '_total'
+        )
+        
         # Fórmula Médica para Anki
         anki_pts = (review * REVIEW_MULTIPLIER) + (learning * LEARNING_MULTIPLIER) + (new * NEW_MULTIPLIER)
+        
+        # Puntos por tarjetas completadas
+        delta_pts = delta * COMPLETED_MULTIPLIER
         
         # Puntaje de Notion (quices)
         n_total = notion.get(student, {}).get('_total', 0)
         notion_pts = n_total * NOTION_MULTIPLIER
         
-        total = anki_pts + notion_pts
+        total = anki_pts + delta_pts + notion_pts
         
         data.append({
             'Estudiante': student,
             'Review': review,
             'Learning': learning,
             'New': new,
+            'Completadas': delta,
             'Pts Anki': round(anki_pts, 1),
+            'Pts Delta': round(delta_pts, 1),
             'Quices': n_total,
             'Pts Notion': round(notion_pts, 1),
             'Score': round(total, 1)
@@ -1385,7 +1636,36 @@ def setup_page():
 
 
 def apply_css():
-    """Estilos CSS."""
+    """Estilos CSS y configuración PWA."""
+    # Meta tags para PWA y móvil
+    st.markdown("""
+    <!-- PWA Meta Tags -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="Competencia">
+    <meta name="theme-color" content="#00d2ff">
+    <link rel="manifest" href="./static/manifest.json">
+    <link rel="apple-touch-icon" href="./static/icon-192.png">
+    
+    <!-- Service Worker Registration -->
+    <script>
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', function() {
+                navigator.serviceWorker.register('./static/sw.js')
+                    .then(function(registration) {
+                        console.log('SW registrado:', registration.scope);
+                    })
+                    .catch(function(error) {
+                        console.log('SW error:', error);
+                    });
+            });
+        }
+    </script>
+    """, unsafe_allow_html=True)
+    
+    # Estilos CSS
     st.markdown("""
     <style>
         .stApp { background: linear-gradient(135deg, #0f0f23 0%, #1a1a3e 100%); }
@@ -1407,6 +1687,22 @@ def apply_css():
         .gold { border: 2px solid #FFD700; }
         .silver { border: 2px solid #C0C0C0; }
         .bronze { border: 2px solid #CD7F32; }
+        
+        /* Responsive para móvil */
+        @media (max-width: 768px) {
+            .main-title { font-size: 1.8rem; }
+            .podium { padding: 0.5rem; }
+            [data-testid="stSidebar"] { min-width: 250px; }
+        }
+        
+        /* Touch-friendly buttons */
+        .stButton > button {
+            min-height: 44px;
+            touch-action: manipulation;
+        }
+        
+        /* Smooth scrolling */
+        html { scroll-behavior: smooth; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -1462,7 +1758,43 @@ def render_sidebar():
             st.markdown(f"• {c}")
         st.markdown("---")
         st.markdown("### 📐 Fórmula Médica")
-        st.code(f"Review×{REVIEW_MULTIPLIER} + Learning×{LEARNING_MULTIPLIER} + New×{NEW_MULTIPLIER} + Quiz×{NOTION_MULTIPLIER}")
+        st.code(f"Review×{REVIEW_MULTIPLIER} + Learning×{LEARNING_MULTIPLIER} + Completadas×{COMPLETED_MULTIPLIER} + Quiz×{NOTION_MULTIPLIER}")
+        st.markdown("---")
+        
+        # Sección de Discord
+        st.markdown("### 📢 Discord")
+        webhook_configured = get_discord_webhook() is not None
+        
+        if webhook_configured:
+            st.success("✅ Webhook configurado")
+            
+            # Selector de qué ranking enviar
+            opciones_discord = ["🏆 General"] + [f"📚 {c}" for c in CURSOS]
+            ranking_a_enviar = st.selectbox(
+                "Ranking a enviar",
+                opciones_discord,
+                key="discord_ranking_select"
+            )
+            
+            if st.button("📢 Enviar a Discord", use_container_width=True):
+                if 'scores' in st.session_state and st.session_state.scores:
+                    # Determinar curso
+                    if ranking_a_enviar == "🏆 General":
+                        curso = None
+                    else:
+                        curso = ranking_a_enviar.replace("📚 ", "")
+                    
+                    ok, msg = notify_ranking_to_discord(st.session_state.scores, curso)
+                    if ok:
+                        st.success(f"✅ {msg}")
+                    else:
+                        st.error(f"❌ {msg}")
+                else:
+                    st.warning("⚠️ Primero actualiza los datos")
+        else:
+            st.warning("⚠️ Webhook no configurado")
+            st.caption("Añade `DISCORD_WEBHOOK_URL` en los secretos")
+        
         st.markdown("---")
         if 'last_update' in st.session_state:
             st.caption(f"🕐 {st.session_state.last_update}")
@@ -1489,6 +1821,11 @@ def main():
                 try:
                     students = get_students_from_secrets()
                     
+                    # Guardar datos anteriores para calcular delta
+                    previous_anki = None
+                    if 'anki_raw' in st.session_state:
+                        previous_anki = st.session_state.anki_raw.copy()
+                    
                     if not students:
                         st.warning("⚠️ Sin estudiantes configurados. Mostrando demo...")
                         anki, notion = load_demo_data(CURSOS)
@@ -1496,10 +1833,24 @@ def main():
                         anki = fetch_anki_stats(students, CURSOS)
                         notion = fetch_notion_scores(CURSOS)
                     
-                    st.session_state.scores = calculate_scores(anki, notion, CURSOS)
-                    st.session_state.anki_raw = anki  # Guardar datos raw para submazos
+                    # Calcular scores con delta
+                    st.session_state.scores = calculate_scores(anki, notion, CURSOS, previous_anki)
+                    st.session_state.anki_raw = anki  # Guardar datos raw para próximo delta
                     st.session_state.last_update = datetime.now().strftime("%H:%M:%S")
-                    st.success("✅ Datos actualizados")
+                    
+                    # Mostrar resumen de tarjetas completadas si hay
+                    if previous_anki:
+                        total_completadas = 0
+                        for student in anki.keys():
+                            if student in previous_anki:
+                                delta = calculate_delta(anki.get(student, {}), previous_anki.get(student, {}), '_total')
+                                total_completadas += delta
+                        if total_completadas > 0:
+                            st.success(f"✅ Datos actualizados • {total_completadas} tarjetas completadas en total")
+                        else:
+                            st.success("✅ Datos actualizados")
+                    else:
+                        st.success("✅ Datos actualizados (primera carga)")
                 except Exception as e:
                     st.error(f"❌ Error: {e}")
     
@@ -1586,7 +1937,7 @@ def main():
     
     # Footer
     st.markdown("---")
-    st.caption(f"📐 Fórmula Médica: (Review×{REVIEW_MULTIPLIER}) + (Learning×{LEARNING_MULTIPLIER}) + (New×{NEW_MULTIPLIER}) + (Quiz×{NOTION_MULTIPLIER}) | v4.0 - Extracción Avanzada")
+    st.caption(f"📐 Fórmula: (Review×{REVIEW_MULTIPLIER}) + (Learning×{LEARNING_MULTIPLIER}) + (Completadas×{COMPLETED_MULTIPLIER}) + (Quiz×{NOTION_MULTIPLIER}) | v5.0 - Delta Scoring + PWA + Discord")
 
 
 if __name__ == "__main__":

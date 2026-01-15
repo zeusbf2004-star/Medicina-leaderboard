@@ -4,12 +4,23 @@ venv/
 env/
 
 # Ignorar archivos de secretos (MUY IMPORTANTE para seguridad)
+.streamlit/secrets.toml
 secrets.toml
 .env
 
 # Ignorar cache de Python
 __pycache__/
 *.pyc
+*.pyo
 
 # Ignorar archivos del sistema
 .DS_Store
+Thumbs.db
+
+# Ignorar archivos de IDE
+.vscode/
+.idea/
+*.swp
+
+# Ignorar logs
+*.log
