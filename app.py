@@ -1637,8 +1637,11 @@ def setup_page():
 
 def apply_css():
     """Estilos CSS y configuración PWA."""
+    # URLs de GitHub Raw para los recursos PWA
+    GITHUB_RAW_BASE = "https://raw.githubusercontent.com/zeusbf2004-star/Medicina-leaderboard/main"
+    
     # Meta tags para PWA y móvil
-    st.markdown("""
+    st.markdown(f"""
     <!-- PWA Meta Tags -->
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <meta name="mobile-web-app-capable" content="yes">
@@ -1646,23 +1649,10 @@ def apply_css():
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="apple-mobile-web-app-title" content="Competencia">
     <meta name="theme-color" content="#00d2ff">
-    <link rel="manifest" href="./static/manifest.json">
-    <link rel="apple-touch-icon" href="./static/icon-192.png">
-    
-    <!-- Service Worker Registration -->
-    <script>
-        if ('serviceWorker' in navigator) {
-            window.addEventListener('load', function() {
-                navigator.serviceWorker.register('./static/sw.js')
-                    .then(function(registration) {
-                        console.log('SW registrado:', registration.scope);
-                    })
-                    .catch(function(error) {
-                        console.log('SW error:', error);
-                    });
-            });
-        }
-    </script>
+    <link rel="manifest" href="{GITHUB_RAW_BASE}/static/manifest.json">
+    <link rel="apple-touch-icon" href="{GITHUB_RAW_BASE}/static/icon-192.png">
+    <link rel="icon" type="image/png" sizes="192x192" href="{GITHUB_RAW_BASE}/static/icon-192.png">
+    <link rel="icon" type="image/png" sizes="512x512" href="{GITHUB_RAW_BASE}/static/icon-512.png">
     """, unsafe_allow_html=True)
     
     # Estilos CSS
