@@ -9,13 +9,13 @@
     "orientation": "any",
     "icons": [
         {
-            "src": "/app/static/icon-192.png",
+            "src": "https://raw.githubusercontent.com/zeusbf2004-star/Medicina-leaderboard/main/static/icon-192.png",
             "sizes": "192x192",
             "type": "image/png",
             "purpose": "any maskable"
         },
         {
-            "src": "/app/static/icon-512.png",
+            "src": "https://raw.githubusercontent.com/zeusbf2004-star/Medicina-leaderboard/main/static/icon-512.png",
             "sizes": "512x512",
             "type": "image/png",
             "purpose": "any maskable"
